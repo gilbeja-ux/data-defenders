@@ -1,0 +1,29 @@
+{
+  "name": "data-defenders",
+  "version": "1.0.0",
+  "description": "A mobile game for iOS and Android - dual-node fiber-optic defense game",
+  "main": "index.html",
+  "scripts": {
+    "start": "npm run build",
+    "build": "node scripts/build.js",
+    "dev": "npm run build && http-server src -c-1 -p 8000",
+    "ios": "ionic cap open ios",
+    "android": "ionic cap open android",
+    "sync": "npm run build && ionic cap sync"
+  },
+  "keywords": [
+    "game",
+    "mobile",
+    "ios",
+    "android",
+    "capacitor"
+  ],
+  "author": "Gil",
+  "license": "MIT",
+  "devDependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/ios": "^6.0.0",
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/cli": "^6.0.0"
+  }
+}

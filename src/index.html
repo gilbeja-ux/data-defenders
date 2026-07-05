@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Data Defenders</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#03060e; touch-action:none;
+    font-family:'Segoe UI', system-ui, -apple-system, sans-serif; user-select:none; -webkit-user-select:none; }
+  canvas { display:block; position:fixed; inset:0; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// DATA DEFENDERS — dual-thumb radial defense prototype
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+let ROT = false; // landscape-only: on portrait screens the whole game renders rotated 90°
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = window.innerWidth, ch = window.innerHeight;
+  ROT = ch > cw;
+  W = ROT ? ch : cw; H = ROT ? cw : ch;
+  canvas.width = cw * DPR; canvas.height = ch * DPR;
+  canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+  if (ROT) ctx.setTransform(0, DPR, -DPR, 0, cw * DPR, 0);
+  else ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBackground();
+}
+window.addEventListener('resize', resize);
+// map screen-space pointer coords into (possibly rotated) game space
+function evPos(e) {
+  return ROT ? { x: e.clientY, y: window.innerWidth - e.clientX } : { x: e.clientX, y: e.clientY };
+}
+
+// ---------- utils ----------
+const TAU = Math.PI * 2;
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function angDiff(a, b) { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// ---------- audio ----------
+let AC = null, sfxGain = null;
+const settings = { sound: true, soundVol: 0.8, music: true, musicVol: 0.5 };
+function applySettings() {
+  saveState();
+  if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
+  const el = currentMusicEl();
+  if (el) el.volume = musicVolume();
+}
+function audio() {
+  if (!AC) {
+    try {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      sfxGain = AC.createGain(); sfxGain.connect(AC.destination);
+      applySettings();
+    } catch (e) {}
+  }
+  if (AC && AC.state === 'suspended') AC.resume();
+  // (re)start the right track — every audio() call originates from a user gesture
+  playTrack(state === S.PLAY || state === S.PAUSE ? levelIdx : 'menu');
+  return AC;
+}
+function tone(freq, dur, type, vol, slideTo, dest) {
+  const ac = AC; if (!ac || !sfxGain) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'square'; o.frequency.setValueAtTime(freq, ac.currentTime);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g); g.connect(dest || sfxGain); o.start(); o.stop(ac.currentTime + dur);
+}
+// ---------- soundtrack (MUSIC_DATA is injected in a script at the end of this file) ----------
+// menu: View From The Dashboard · L1: Sub Level Three · L2: Steel and Rain · L3: Terminal Velocity
+let musicEls = null, currentTrackKey = null;
+const musicVolume = () => settings.music ? settings.musicVol : 0;
+function ensureMusicEls() {
+  if (musicEls || !window.MUSIC_DATA) return;
+  try {
+    musicEls = { menu: new Audio(window.MUSIC_DATA.menu), levels: window.MUSIC_DATA.levels.map(s => new Audio(s)) };
+    [musicEls.menu, ...musicEls.levels].forEach(a => { a.loop = true; a.preload = 'auto'; });
+  } catch (e) { musicEls = null; }
+}
+function currentMusicEl() {
+  if (!musicEls || currentTrackKey === null) return null;
+  return currentTrackKey === 'menu' ? musicEls.menu : musicEls.levels[currentTrackKey];
+}
+function playTrack(key) {
+  ensureMusicEls(); if (!musicEls) return;
+  if (key !== currentTrackKey) {
+    const old = currentMusicEl();
+    if (old) { old.pause(); old.currentTime = 0; }
+    currentTrackKey = key;
+  }
+  const el = currentMusicEl();
+  if (el) { el.volume = musicVolume(); if (el.paused) el.play().catch(() => {}); }
+}
+const sfx = {
+  zap()  { tone(880, 0.12, 'square', 0.10, 220); tone(1760, 0.08, 'sawtooth', 0.05, 440); },
+  miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
+  win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
+  fail() { [330, 262, 196].forEach((f, i) => setTimeout(() => tone(f, 0.3, 'sawtooth', 0.1), i * 180)); },
+  tick() { tone(1200, 0.05, 'square', 0.05); }
+};
+
+// ---------- background (deep data-space behind the tunnel walls) ----------
+let bgCanvas = null, vignetteCanvas = null, wallTex = null;
+let bgMotes = [], glitchT = 0, glitchY = 0, nextGlitch = 3;
+let litPanels = [], wallSnips = [];
+function randCode() {
+  let s = '';
+  const hex = Math.random() < 0.25;
+  const len = hex ? 4 + (Math.random() * 4 | 0) : 6 + (Math.random() * 9 | 0);
+  for (let j = 0; j < len; j++) s += hex ? '0123456789ABCDEF'[Math.random() * 16 | 0] : (Math.random() < 0.5 ? '0' : '1');
+  return hex ? '0x' + s : s;
+}
+function buildBackground() {
+  // live layer state
+  bgMotes = [];
+  for (let i = 0; i < 18; i++) {
+    bgMotes.push({ x: Math.random() * W, y: Math.random() * H, sp: rand(4, 14), r: rand(0.6, 1.8), ph: rand(0, TAU), white: Math.random() < 0.3 });
+  }
+  litPanels = [];
+  // code snippets streaming along the tunnel walls (both directions — live traffic)
+  wallSnips = [];
+  for (let i = 0; i < 30; i++) {
+    wallSnips.push({
+      a: Math.random() * TAU, z: Math.random(), str: randCode().slice(0, 9),
+      amber: Math.random() < 0.22, sp: rand(0.7, 1.4),
+      dir: Math.random() < 0.6 ? -1 : 1 // -1 = incoming (toward player), +1 = outgoing
+    });
+  }
+  // vignette cache
+  vignetteCanvas = document.createElement('canvas');
+  vignetteCanvas.width = W * DPR; vignetteCanvas.height = H * DPR;
+  const v = vignetteCanvas.getContext('2d');
+  v.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const vg = v.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.42, W / 2, H / 2, Math.max(W, H) * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.38)');
+  v.fillStyle = vg; v.fillRect(0, 0, W, H);
+
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = W * DPR; bgCanvas.height = H * DPR;
+  const b = bgCanvas.getContext('2d');
+  b.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // deep navy base — the void behind the tunnel wall circuitry
+  b.fillStyle = '#020510'; b.fillRect(0, 0, W, H);
+  // dense circuit-board traces (visible in the gaps between rings)
+  for (let i = 0; i < 85; i++) {
+    const roll = Math.random();
+    b.strokeStyle = roll < 0.22
+      ? 'rgba(255,180,80,' + (0.04 + Math.random() * 0.08).toFixed(2) + ')'
+      : roll < 0.32
+        ? 'rgba(230,245,255,' + (0.04 + Math.random() * 0.07).toFixed(2) + ')'
+        : 'rgba(70,150,240,' + (0.04 + Math.random() * 0.1).toFixed(2) + ')';
+    b.lineWidth = Math.random() < 0.15 ? 2 : 1;
+    b.beginPath();
+    let x = Math.random() * W, y = Math.random() * H;
+    b.moveTo(x, y);
+    for (let j = 0; j < 4; j++) {
+      if (Math.random() < 0.5) x += rand(-80, 80); else y += rand(-50, 50);
+      b.lineTo(x, y);
+    }
+    b.stroke();
+  }
+  // binary blocks everywhere, layered brightnesses
+  b.font = '9px monospace';
+  for (let i = 0; i < 130; i++) {
+    const al = 0.04 + Math.random() * 0.12;
+    const roll = Math.random();
+    b.fillStyle = roll < 0.22 ? `rgba(255,190,90,${al.toFixed(2)})`
+      : roll < 0.32 ? `rgba(235,248,255,${al.toFixed(2)})`
+      : `rgba(90,170,255,${al.toFixed(2)})`;
+    b.fillText(randCode(), Math.random() * W, Math.random() * H);
+  }
+  // small solid data chips
+  for (let i = 0; i < 45; i++) {
+    const al = 0.05 + Math.random() * 0.1;
+    b.fillStyle = Math.random() < 0.25 ? `rgba(255,185,80,${al.toFixed(2)})` : `rgba(100,180,255,${al.toFixed(2)})`;
+    b.fillRect(Math.random() * W, Math.random() * H, rand(3, 14), rand(2, 5));
+  }
+
+  // --- the tunnel wall texture: one dense annulus of raw data, stamped at many depths ---
+  const TS = Math.min(1024, Math.round(Math.min(W, H) * 1.7));
+  const half = TS / 2;
+  wallTex = document.createElement('canvas');
+  wallTex.width = TS; wallTex.height = TS;
+  const t = wallTex.getContext('2d');
+  t.translate(half, half);
+  const inR = half * 0.55, outR = half * 0.98;
+  const pick = (al) => {
+    const r = Math.random();
+    return r < 0.2 ? `rgba(255,185,80,${al})` : r < 0.35 ? `rgba(235,248,255,${al})` : `rgba(80,180,255,${al})`;
+  };
+  // hundreds of broken concentric arc dashes — the stacked circuitry look
+  for (let i = 0; i < 650; i++) {
+    const rr = rand(inR, outR);
+    const a0 = Math.random() * TAU, len = rand(0.03, 0.5);
+    t.strokeStyle = pick((0.1 + Math.random() * 0.4).toFixed(2));
+    t.lineWidth = Math.random() < 0.12 ? rand(2, 3.2) : rand(0.6, 1.6);
+    t.beginPath(); t.arc(0, 0, rr, a0, a0 + len); t.stroke();
+  }
+  // binary strings packed around the band
+  t.textAlign = 'center';
+  for (let i = 0; i < 170; i++) {
+    const rr = rand(inR, outR), a0 = Math.random() * TAU;
+    t.save();
+    t.rotate(a0); t.translate(rr, 0); t.rotate(Math.PI / 2);
+    t.font = (7 + Math.random() * 7 | 0) + 'px monospace';
+    t.fillStyle = pick((0.12 + Math.random() * 0.3).toFixed(2));
+    t.fillText(randCode(), 0, 0);
+    t.restore();
+  }
+  // radial ticks
+  for (let i = 0; i < 140; i++) {
+    const rr = rand(inR, outR - 14), a0 = Math.random() * TAU;
+    t.strokeStyle = pick((0.1 + Math.random() * 0.3).toFixed(2));
+    t.lineWidth = 1;
+    t.save(); t.rotate(a0);
+    t.beginPath(); t.moveTo(rr, 0); t.lineTo(rr + rand(3, 14), 0); t.stroke();
+    t.restore();
+  }
+  // bright specks and chips
+  for (let i = 0; i < 160; i++) {
+    const rr = rand(inR, outR), a0 = Math.random() * TAU;
+    t.fillStyle = pick((0.15 + Math.random() * 0.4).toFixed(2));
+    t.save(); t.rotate(a0);
+    t.fillRect(rr, 0, rand(1.5, 6), rand(1, 2.5));
+    t.restore();
+  }
+}
+// animated background layer: drifting motes + rare glitch scanlines (kept subtle)
+function drawLiveBg(dt) {
+  for (const m of bgMotes) {
+    m.y -= m.sp * dt;
+    if (m.y < -4) { m.y = H + 4; m.x = Math.random() * W; }
+    const al = 0.06 + (Math.sin(time * 2 + m.ph) * 0.5 + 0.5) * 0.1;
+    ctx.fillStyle = m.white ? `rgba(255,255,255,${al.toFixed(2)})` : `rgba(120,220,255,${al.toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, TAU); ctx.fill();
+  }
+  nextGlitch -= dt;
+  if (nextGlitch <= 0) { glitchT = 0.12; glitchY = Math.random() * H; nextGlitch = rand(2.5, 6.5); }
+  if (glitchT > 0) {
+    glitchT -= dt;
+    ctx.fillStyle = 'rgba(90,220,255,0.05)';
+    ctx.fillRect(0, glitchY, W, 3);
+    ctx.fillStyle = 'rgba(255,140,40,0.05)';
+    ctx.fillRect(0, glitchY + 7, W, 2);
+  }
+}
+// binary / hex snippets racing along the tunnel axis — glyph by glyph, in true perspective,
+// flowing both toward and away from the player like live traffic on the line
+function drawWallCode(g, dt) {
+  const spd = state === S.PLAY ? 0.55 : 0.2;
+  const dz = 0.045; // depth spacing between glyphs — converges with perspective
+  ctx.textAlign = 'center';
+  for (const c of wallSnips) {
+    c.z += dt * spd * c.sp * c.dir;
+    if (c.dir < 0 && c.z < -0.08 - c.str.length * dz) { c.z = 1; c.a = Math.random() * TAU; c.str = randCode().slice(0, 9); }
+    if (c.dir > 0 && c.z > 1) { c.z = -0.05; c.a = Math.random() * TAU; c.str = randCode().slice(0, 9); }
+    const cosA = Math.cos(c.a), sinA = Math.sin(c.a);
+    for (let j = 0; j < c.str.length; j++) {
+      const zj = c.z + j * dz;
+      if (zj > 1 || zj < -0.07) continue;
+      const rg = ring(zj, g);
+      const fs = 46 * rg.s;
+      if (fs < 4) continue;
+      const x = rg.x + cosA * rg.r * 0.985, y = rg.y + sinA * rg.r * 0.985;
+      const al = Math.min(1 - zj, 1.05) * 0.6 * clamp((zj + 0.07) / 0.12, 0, 1); // glyphs slide past and fade, no pop
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(c.a); // baseline runs along the tunnel direction, toward the vanish point
+      ctx.font = Math.min(fs, 17).toFixed(1) + 'px monospace';
+      ctx.fillStyle = c.amber ? `rgba(255,190,85,${al.toFixed(2)})` : `rgba(130,200,255,${al.toFixed(2)})`;
+      ctx.fillText(c.str[j], 0, 0);
+      ctx.restore();
+    }
+  }
+  ctx.textAlign = 'left';
+}
+
+// ---------- levels ----------
+const LEVELS = [
+  { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.5, spawnMax: 2.3, speed: 0.34, doubles: 0.00, crawlers: 0.00 },
+  { name: 'CITY GRID',      duration: 55, spawnMin: 1.0, spawnMax: 1.8, speed: 0.42, doubles: 0.30, crawlers: 0.00 },
+  { name: 'GLOBAL BACKBONE',duration: 70, spawnMin: 0.75,spawnMax: 1.5, speed: 0.50, doubles: 0.40, crawlers: 0.35 }
+];
+const progress = { unlocked: 1, stars: [0, 0, 0] };
+
+// ---------- persistence ----------
+const STORE_KEY = 'dataDefenders.v1';
+function saveState() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify({ progress, settings })); } catch (e) {}
+}
+(function loadState() {
+  try {
+    const d = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (d) {
+      if (d.progress) Object.assign(progress, d.progress);
+      if (d.settings) Object.assign(settings, d.settings);
+    }
+  } catch (e) {}
+})();
+
+// ---------- game state ----------
+const S = { MENU: 0, PLAY: 1, END: 2, PAUSE: 3 };
+let state = S.MENU;
+let levelIdx = 0, levelT = 0, spawnT = 0;
+let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0;
+let enemies = [], particles = [], popups = [];
+let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
+let endWin = false, endStars = 0, endT = 0;
+let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
+const pauseDrag = {};
+
+// nodes: [left(blue), right(white)]
+const nodes = [
+  { angle: Math.PI, color: '#1c3f8f', glow: '#4d8dff' },
+  { angle: 0,       color: '#ffffff', glow: '#bfe0ff' }
+];
+
+// ---------- geometry ----------
+function geo() {
+  const cx = W / 2, cy = H / 2;
+  const nodeR = Math.min(W, H) * 0.44;            // the fixed node holder ring — nearly touches top/bottom
+  const R0 = Math.hypot(W, H) / 2 * 1.08;         // nearest ring covers the whole screen
+  const hitZ = (R0 / nodeR - 1) / 6;              // depth where the tunnel wall crosses the node ring
+  // layered sines -> fluid meander like a fiber optic strand
+  const sw  = Math.sin(time * 0.50) * 0.34 + Math.sin(time * 0.23) * 0.28 + Math.sin(time * 0.11) * 0.22;
+  const swy = Math.sin(time * 0.34) * 0.42 + Math.sin(time * 0.15) * 0.4;
+  return { cx, cy, R0, nodeR, hitZ, sw, swy };
+}
+// depth z: 0 = past the player, 1 = far end. Swerve is anchored at the node ring
+// (q=0 there), so traps always arrive exactly on the ring.
+function ring(z, g) {
+  const s = 1 / (1 + z * 6);
+  let q = (z - g.hitZ) / (1 - g.hitZ);
+  if (q < 0) q *= 0.4; // gentle opposite parallax for the wall rushing past the ring
+  const off = Math.min(W, H) * 0.25;
+  return { x: g.cx + g.sw * off * q, y: g.cy + g.swy * off * 0.7 * q, r: g.R0 * s, s };
+}
+
+// ---------- enemies ----------
+function spawnEnemy(forcedAngle) {
+  const L = LEVELS[levelIdx];
+  const crawler = Math.random() < L.crawlers;
+  // per-enemy iridescent crystal cluster + dense branching filaments (stable random shapes)
+  const shards = [];
+  const nS = 11 + (Math.random() * 4 | 0);
+  for (let i = 0; i < nS; i++) {
+    shards.push({ a: i / nS * TAU + rand(-0.3, 0.3), r: rand(0.45, 1.05), w: rand(0.25, 0.55), tone: Math.random(), hue: Math.random() });
+  }
+  const tendrils = [];
+  const nT = 13 + (Math.random() * 5 | 0);
+  for (let i = 0; i < nT; i++) {
+    tendrils.push({
+      a: rand(0, TAU), len: rand(1.3, 2.7), bend: rand(-0.7, 0.7), ph: rand(0, TAU),
+      br: rand(0.4, 0.7), brA: rand(0.35, 0.85) * (Math.random() < 0.5 ? -1 : 1), glint: Math.random() < 0.3
+    });
+  }
+  enemies.push({
+    z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
+    drift: crawler ? (Math.random() < 0.5 ? 1 : -1) * rand(0.25, 0.5) : 0,
+    crawler, spin: Math.random() * TAU, dead: false, shards, tendrils
+  });
+}
+function trySpawn(dt) {
+  spawnT -= dt;
+  if (spawnT <= 0) {
+    const L = LEVELS[levelIdx];
+    spawnT = rand(L.spawnMin, L.spawnMax);
+    const a = Math.random() * TAU;
+    spawnEnemy(a);
+    if (Math.random() < L.doubles) spawnEnemy(a + Math.PI + rand(-0.6, 0.6));
+  }
+}
+
+// ---------- particles ----------
+function burst(x, y, color, n, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, v = rand(0.3, 1) * spd;
+    particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 1, decay: rand(1.2, 2.6), color, size: rand(1.5, 4) });
+  }
+}
+function popup(x, y, text, color) { popups.push({ x, y, text, color, life: 1 }); }
+
+// ---------- input ----------
+const pointers = {}; // id -> { side, lastA }
+const isLandscape = () => W > H;
+function dialCenter(side) {
+  if (isLandscape()) {
+    // corner dials, proportioned like the mock
+    const r = H * 0.21, mx = H * 0.25, my = H * 0.75;
+    return side === 'L' ? { x: mx, y: my, r } : { x: W - mx, y: my, r };
+  }
+  const m = Math.min(W, H) * 0.17;
+  return side === 'L' ? { x: m * 0.95, y: H - m * 0.95, r: m * 0.72 } : { x: W - m * 0.95, y: H - m * 0.95, r: m * 0.72 };
+}
+// try to go fullscreen + lock landscape (works on Android; iOS shows rotate prompt instead)
+let lockTried = false;
+function tryLockLandscape() {
+  if (lockTried) return; lockTried = true;
+  try {
+    const el = document.documentElement;
+    const fs = el.requestFullscreen ? el.requestFullscreen() : Promise.reject();
+    fs.then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
+  } catch (e) {}
+}
+function pointerAngle(side, px, py) {
+  const d = dialCenter(side);
+  return Math.atan2(py - d.y, px - d.x);
+}
+canvas.addEventListener('pointerdown', e => {
+  audio();
+  if (e.pointerType === 'touch') tryLockLandscape();
+  const P = evPos(e);
+  if (state === S.MENU) { menuTap(P.x, P.y); return; }
+  if (state === S.END)  { endTap(P.x, P.y); return; }
+  if (state === S.PAUSE) { pauseTap(P.x, P.y, e.pointerId); return; }
+  // pause button (generous hit area)
+  if (pauseBtnRect && P.x > pauseBtnRect.x - 8 && P.x < pauseBtnRect.x + pauseBtnRect.w + 8 &&
+      P.y > pauseBtnRect.y - 8 && P.y < pauseBtnRect.y + pauseBtnRect.h + 8) {
+    state = S.PAUSE; sfx.tick(); return;
+  }
+  const side = P.x < W / 2 ? 'L' : 'R';
+  // relative control: touching does NOT snap the node — record the start angle
+  pointers[e.pointerId] = { side, lastA: pointerAngle(side, P.x, P.y) };
+  canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  const P = evPos(e);
+  const sl = pauseDrag[e.pointerId];
+  if (sl && state === S.PAUSE) {
+    settings[sl.key] = clamp((P.x - sl.x) / sl.w, 0, 1);
+    applySettings();
+    return;
+  }
+  const p = pointers[e.pointerId];
+  if (!p || state !== S.PLAY) return;
+  const a = pointerAngle(p.side, P.x, P.y);
+  const delta = angDiff(a, p.lastA);
+  p.lastA = a;
+  nodes[p.side === 'L' ? 0 : 1].angle += delta; // 1:1, zero-lag: node mirrors the thumb exactly
+});
+function releasePointer(e) { delete pointers[e.pointerId]; delete pauseDrag[e.pointerId]; }
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+
+// keyboard fallback for desktop testing
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.key] = true; audio();
+  if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
+    if (state === S.PLAY) { state = S.PAUSE; sfx.tick(); }
+    else if (state === S.PAUSE) { state = S.PLAY; sfx.tick(); }
+  }
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// ---------- menu / end screens hit areas ----------
+let menuButtons = [];
+function menuTap(x, y) {
+  for (const b of menuButtons) {
+    if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h && !b.locked) {
+      startLevel(b.level); sfx.tick(); return;
+    }
+  }
+}
+let endButtons = [];
+function endTap(x, y) {
+  for (const b of endButtons) {
+    if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
+      sfx.tick();
+      if (b.action === 'retry') startLevel(levelIdx);
+      else if (b.action === 'next') startLevel(levelIdx + 1);
+      else { state = S.MENU; playTrack('menu'); }
+      return;
+    }
+  }
+}
+
+function startLevel(i) {
+  levelIdx = i; levelT = 0; spawnT = 1.2;
+  integrity = 100; score = 0; zaps = 0; misses = 0; combo = 0;
+  enemies = []; particles = []; popups = [];
+  nodes[0].angle = Math.PI * 0.75;
+  nodes[1].angle = Math.PI * 0.25;
+  state = S.PLAY;
+  playTrack(i);
+}
+
+function endLevel(win) {
+  endWin = win; endT = 0;
+  endStars = win ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
+  if (win) {
+    progress.stars[levelIdx] = Math.max(progress.stars[levelIdx], endStars);
+    progress.unlocked = Math.max(progress.unlocked, Math.min(levelIdx + 2, LEVELS.length));
+    saveState();
+    sfx.win();
+  } else sfx.fail();
+  state = S.END;
+}
+
+// ---------- update ----------
+function update(dt) {
+  time += dt;
+  tunnelScroll = (tunnelScroll + dt * (state === S.PLAY ? 1.4 : 0.5)) % 10;
+  shake = Math.max(0, shake - dt * 3);
+  redFlash = Math.max(0, redFlash - dt * 2);
+
+  // particles & popups always animate
+  for (const p of particles) { p.x += p.vx * dt * 60; p.y += p.vy * dt * 60; p.vx *= 0.96; p.vy *= 0.96; p.life -= p.decay * dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const p of popups) { p.y -= 30 * dt; p.life -= dt * 0.9; }
+  popups = popups.filter(p => p.life > 0);
+
+  if (state !== S.PLAY) { endT += dt; return; }
+
+  const L = LEVELS[levelIdx];
+  levelT += dt;
+
+  // keyboard control (desktop testing)
+  const kSpd = 4.5 * dt;
+  if (keys['a'] || keys['A']) nodes[0].angle -= kSpd;
+  if (keys['d'] || keys['D']) nodes[0].angle += kSpd;
+  if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
+  if (keys['ArrowRight']) nodes[1].angle += kSpd;
+
+  if (levelT < L.duration) trySpawn(dt); // stop spawning once the run distance is covered
+
+  const g = geo();
+  const TOL = 0.314; // angular tolerance ~18°
+
+  for (const en of enemies) {
+    en.z -= L.speed * dt;
+    en.spin += dt * 4;
+    if (en.drift) en.angle += en.drift * dt;
+
+    if (!en.dead && !en.resolved && en.z <= g.hitZ) {
+      let hit = false;
+      for (const n of nodes) {
+        if (Math.abs(angDiff(n.angle, en.angle)) < TOL) { hit = true; break; }
+      }
+      const ex = g.cx + Math.cos(en.angle) * g.nodeR, ey = g.cy + Math.sin(en.angle) * g.nodeR;
+      if (hit) {
+        en.dead = true;
+        combo++;
+        const pts = 100 * Math.min(combo, 5);
+        score += pts; zaps++;
+        burst(ex, ey, '#bfeaff', 26, 4);
+        burst(ex, ey, '#ffffff', 14, 5);
+        popup(ex, ey, '+' + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), '#bfeaff');
+        shake = Math.min(shake + 0.35, 0.8);
+        sfx.zap();
+        if (navigator.vibrate) navigator.vibrate(18);
+      } else {
+        en.resolved = true; // slips past the ring and flies by the player
+        misses++; combo = 0;
+        integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
+        burst(ex, ey, '#ff4a5e', 20, 3);
+        popup(ex, ey, 'DATA STOLEN', '#ff4a5e');
+        redFlash = 1; shake = Math.min(shake + 0.6, 1);
+        sfx.miss();
+        if (navigator.vibrate) navigator.vibrate([40, 40, 60]);
+      }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead && e.z > 0.03);
+
+  if (integrity <= 0) { endLevel(false); return; }
+  if (levelT >= L.duration && enemies.length === 0) { endLevel(true); }
+}
+
+// ---------- drawing ----------
+function drawTunnel(g) {
+  // the wall is one dense annulus of data, stamped at receding depths —
+  // the inside of a fiber optic line packed with traffic, not clean geometry
+  const N = 10;
+  for (let i = N - 1; i >= 0; i--) {
+    const z = (((i - tunnelScroll) % N) + N) % N / N;
+    const rg = ring(z, g);
+    const hs = rg.r / 0.75; // texture band mid-radius maps onto this depth's wall radius
+    if (hs < 5) continue;
+    const a = (1 - z) * 0.85 + 0.08;
+    ctx.save();
+    ctx.translate(rg.x, rg.y);
+    ctx.rotate(i * 0.55 + time * 0.015); // each depth band has its own twist, drifting slowly
+    ctx.globalAlpha = a;
+    if (wallTex) ctx.drawImage(wallTex, -hs, -hs, hs * 2, hs * 2);
+    ctx.restore();
+    // the nearest band keeps sliding past the viewer and fades — no pop at the wrap
+    if (z > 0.85 && wallTex) {
+      const z2 = z - 1;
+      const rg2 = ring(z2, g);
+      const hs2 = rg2.r / 0.75;
+      const a2 = clamp(1 + z2 / 0.15, 0, 1) * 0.9;
+      if (a2 > 0.01) {
+        ctx.save();
+        ctx.translate(rg2.x, rg2.y);
+        ctx.rotate(i * 0.55 + time * 0.015);
+        ctx.globalAlpha = a2;
+        ctx.drawImage(wallTex, -hs2, -hs2, hs2 * 2, hs2 * 2);
+        ctx.restore();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  // vanish point glow
+  // warm-white vanish point — the golden river converges into it
+  const far = ring(1, g);
+  const grad = ctx.createRadialGradient(far.x, far.y, 0, far.x, far.y, far.r * 4.5);
+  grad.addColorStop(0, 'rgba(255,244,220,0.6)');
+  grad.addColorStop(0.35, 'rgba(255,200,110,0.16)');
+  grad.addColorStop(0.7, 'rgba(90,160,255,0.07)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(far.x - far.r * 4.5, far.y - far.r * 4.5, far.r * 9, far.r * 9);
+}
+
+// streaming gold data particles (the "payload" river at tunnel bottom)
+let streaks = [];
+function initStreaks() {
+  streaks = [];
+  for (let i = 0; i < 190; i++) {
+    streaks.push({
+      z: Math.random(),
+      a: Math.PI / 2 + rand(-0.55, 0.55),          // biased to bottom
+      gold: true, sp: rand(0.5, 1)
+    });
+  }
+  for (let i = 0; i < 110; i++) {
+    streaks.push({ z: Math.random(), a: Math.random() * TAU, gold: false, amber: Math.random() < 0.22, sp: rand(0.4, 0.9) });
+  }
+}
+initStreaks();
+function drawStreaks(g, dt) {
+  for (const st of streaks) {
+    st.z -= dt * (state === S.PLAY ? 0.9 : 0.4) * st.sp;
+    if (st.z <= -0.08) { st.z = 1; if (st.gold) st.a = Math.PI / 2 + rand(-0.55, 0.55); }
+    const r1 = ring(st.z, g), r2 = ring(Math.min(st.z + (st.gold ? 0.05 : 0.09), 1), g);
+    const rr1 = st.gold ? r1.r * rand(0.86, 0.99) : r1.r * 0.97;
+    const x1 = r1.x + Math.cos(st.a) * rr1, y1 = r1.y + Math.sin(st.a) * rr1;
+    const x2 = r2.x + Math.cos(st.a) * r2.r * 0.95, y2 = r2.y + Math.sin(st.a) * r2.r * 0.95;
+    const al = Math.min(1 - st.z, 1.05) * (st.gold ? 0.75 : 0.3) * clamp(1 + st.z / 0.1, 0, 1);
+    ctx.strokeStyle = st.gold ? `rgba(255,196,88,${al.toFixed(2)})`
+      : st.amber ? `rgba(255,185,90,${al.toFixed(2)})` : `rgba(140,215,255,${al.toFixed(2)})`;
+    ctx.lineWidth = st.gold ? lerp(0.5, 2.6, 1 - st.z) : 1;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    // hot core on the nearest gold particles
+    if (st.gold && st.z < 0.35) {
+      ctx.strokeStyle = `rgba(255,238,190,${(al * 0.7).toFixed(2)})`;
+      ctx.lineWidth = 0.8;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
+  }
+}
+
+function drawEnemy(en, g) {
+  const rg = ring(Math.max(en.z, 0.02), g);
+  const x = rg.x + Math.cos(en.angle) * rg.r;
+  const y = rg.y + Math.sin(en.angle) * rg.r;
+  let size = lerp(4, Math.min(W, H) * 0.06, 1 - en.z);
+  const near = 1 - en.z;
+  // missed traps balloon past the ring and dissolve; fresh ones fade in from the deep
+  let fade = en.resolved ? clamp(en.z / g.hitZ, 0, 1) : 1;
+  fade *= clamp((1.08 - en.z) / 0.18, 0, 1); // smooth entrance — no popping
+  if (fade <= 0.005) return;
+  if (en.resolved) size *= 1 + (1 - clamp(en.z / g.hitZ, 0, 1)) * 1.6;
+  // iridescent palettes — like the sprite: rich, varied facets, tinted hostile red/orange
+  const PAL = en.crawler
+    ? { glow: '255,150,40', tendril: '#8a4a12', tendrilHi: '#ffb361',
+        shades: ['#ff8c2a', '#e05e14', '#ffb340', '#c24a08', '#ff7a50'],
+        lights: ['#ffd98f', '#ffe9c0', '#ffb361'] }
+    : { glow: '255,60,90', tendril: '#6e1030', tendrilHi: '#ff7a8c',
+        shades: ['#e8274b', '#ff5a3c', '#d81f6e', '#b3123a', '#ff8c5a'],
+        lights: ['#ff9db0', '#ffc9d4', '#ff8ba0'] };
+
+  ctx.save();
+  ctx.globalAlpha = fade;
+  ctx.translate(x, y);
+  ctx.rotate(en.angle + Math.sin(en.spin * 0.7) * 0.2); // slow strain, anchored to the wall
+
+  // dense branching filaments radiating in all directions (fade in as it approaches)
+  if (near > 0.2) {
+    const ta = clamp((near - 0.2) / 0.45, 0, 1) * fade;
+    ctx.lineCap = 'round';
+    for (const t of en.tendrils) {
+      const wob = Math.sin(en.spin * 1.2 + t.ph) * 0.1;
+      const a0 = t.a + wob;
+      const L2 = size * t.len;
+      const mx = Math.cos(a0 + t.bend * 0.5) * L2 * 0.5, my = Math.sin(a0 + t.bend * 0.5) * L2 * 0.5;
+      const ex2 = Math.cos(a0 + t.bend) * L2, ey2 = Math.sin(a0 + t.bend) * L2;
+      // main filament — thin, dark, wiry
+      ctx.globalAlpha = ta * 0.9;
+      ctx.strokeStyle = PAL.tendril;
+      ctx.lineWidth = Math.max(0.6, size * 0.05);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(mx, my, ex2, ey2); ctx.stroke();
+      // fork branching off midway
+      const bx2 = mx + Math.cos(a0 + t.brA) * L2 * 0.45, by2 = my + Math.sin(a0 + t.brA) * L2 * 0.45;
+      ctx.lineWidth = Math.max(0.5, size * 0.035);
+      ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(bx2, by2); ctx.stroke();
+      // glinting lit filament tips
+      if (t.glint) {
+        ctx.globalAlpha = ta * (0.4 + (Math.sin(time * 6 + t.ph) * 0.5 + 0.5) * 0.6);
+        ctx.strokeStyle = PAL.tendrilHi;
+        ctx.lineWidth = Math.max(0.5, size * 0.03);
+        ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(mx, my, ex2, ey2); ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(ex2, ey2, Math.max(0.8, size * 0.05), 0, TAU); ctx.fill();
+      }
+    }
+    ctx.globalAlpha = fade;
+  }
+
+  // hot glow
+  const pulse = 1 + Math.sin(en.spin * 2) * 0.08;
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 2.4 * pulse);
+  gl.addColorStop(0, `rgba(${PAL.glow},0.5)`);
+  gl.addColorStop(0.5, `rgba(${PAL.glow},0.16)`);
+  gl.addColorStop(1, `rgba(${PAL.glow},0)`);
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, size * 2.4 * pulse, 0, TAU); ctx.fill();
+
+  // faceted iridescent crystal cluster
+  for (const s of en.shards) {
+    const r = size * s.r * pulse * 0.85;
+    const ax = Math.cos(s.a) * r, ay = Math.sin(s.a) * r;
+    const b1 = s.a + s.w, b2 = s.a - s.w;
+    const bx1 = Math.cos(b1) * r * 0.38, by1 = Math.sin(b1) * r * 0.38;
+    const bx2 = Math.cos(b2) * r * 0.38, by2 = Math.sin(b2) * r * 0.38;
+    const base = PAL.shades[(s.hue * PAL.shades.length) | 0];
+    const lite = PAL.lights[(s.tone * PAL.lights.length) | 0];
+    const sg = ctx.createLinearGradient(bx1, by1, ax, ay);
+    sg.addColorStop(0, base);
+    sg.addColorStop(1, s.tone > 0.55 ? lite : '#3d0a18');
+    ctx.fillStyle = sg;
+    ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(ax, ay); ctx.lineTo(bx2, by2); ctx.closePath(); ctx.fill();
+    // bright facet edge on some shards — the iridescent glint
+    if (s.tone > 0.7) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 0.8;
+      ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(ax, ay); ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 0.6;
+      ctx.beginPath(); ctx.moveTo(bx1, by1); ctx.lineTo(ax, ay); ctx.lineTo(bx2, by2); ctx.closePath(); ctx.stroke();
+    }
+  }
+  // molten amber core burning through the facets
+  const cg = ctx.createRadialGradient(-size * 0.12, -size * 0.14, 0, 0, 0, size * 0.48);
+  cg.addColorStop(0, '#ffffff');
+  cg.addColorStop(0.3, '#ffd24a');
+  cg.addColorStop(0.7, en.crawler ? '#ff8c2a' : '#ff5a3c');
+  cg.addColorStop(1, 'rgba(255,90,60,0)');
+  ctx.fillStyle = cg;
+  ctx.beginPath(); ctx.arc(0, 0, size * 0.48 * pulse, 0, TAU); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.beginPath(); ctx.ellipse(-size * 0.14, -size * 0.17, size * 0.1, size * 0.06, -0.6, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function drawNodes(g) {
+  const bzn = Math.min(W, H) * 0.055;
+  const railR = g.nodeR - bzn * 0.86;             // carriages ride the rails on the ring's inner face
+  const nearR = { x: g.cx, y: g.cy, r: railR };
+  for (let i = 0; i < 2; i++) {
+    const n = nodes[i];
+    const x = nearR.x + Math.cos(n.angle) * nearR.r;
+    const y = nearR.y + Math.sin(n.angle) * nearR.r;
+    const size = Math.min(W, H) * 0.038;
+    const cCol = i === 0 ? '111,227,255' : '255,255,255'; // left: Tron cyan, right: white
+    // lightcycle ribbon trail
+    const vel = angDiff(n.angle, n.prevA === undefined ? n.angle : n.prevA);
+    n.trailV = (n.trailV || 0) * 0.8 + vel * 0.2;
+    n.prevA = n.angle;
+    const tl = clamp(Math.abs(n.trailV) * 10, 0, 1.5);
+    if (tl > 0.04) {
+      const dir = Math.sign(n.trailV) || 1;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = `rgba(${cCol},0.3)`;
+      ctx.lineWidth = size * 1.5;
+      ctx.beginPath();
+      ctx.arc(nearR.x, nearR.y, nearR.r, n.angle - dir * tl, n.angle, dir < 0);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(240,252,255,0.55)';
+      ctx.lineWidth = size * 0.4;
+      ctx.beginPath();
+      ctx.arc(nearR.x, nearR.y, nearR.r, n.angle - dir * tl, n.angle, dir < 0);
+      ctx.stroke();
+    }
+    // coverage arc hint — drawn on the ring itself, where traps arrive
+    ctx.beginPath();
+    ctx.arc(nearR.x, nearR.y, g.nodeR, n.angle - 0.314, n.angle + 0.314);
+    ctx.strokeStyle = `rgba(${cCol},0.5)`;
+    ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.stroke();
+    // glow
+    const gl = ctx.createRadialGradient(x, y, 0, x, y, size * 2.6);
+    gl.addColorStop(0, `rgba(${cCol},0.6)`);
+    gl.addColorStop(1, `rgba(${cCol},0)`);
+    ctx.fillStyle = gl;
+    ctx.beginPath(); ctx.arc(x, y, size * 2.6, 0, TAU); ctx.fill();
+    // maglev carriage — a techy sled locked onto the rails, gripping the ring
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(n.angle); // +x = radially outward, +y = along the rail
+    const rh = size * 2.5, rw = size * 1.05;
+    // grip struts reaching out onto the ring, with glowing contact pads
+    ctx.fillStyle = '#0a1220';
+    roundRect(rw * 0.2, -rh * 0.44, bzn * 0.95, rh * 0.16, 3); ctx.fill();
+    roundRect(rw * 0.2, rh * 0.28, bzn * 0.95, rh * 0.16, 3); ctx.fill();
+    ctx.fillStyle = `rgba(${cCol},0.85)`;
+    ctx.fillRect(rw * 0.2 + bzn * 0.78, -rh * 0.42, 2.5, rh * 0.12);
+    ctx.fillRect(rw * 0.2 + bzn * 0.78, rh * 0.30, 2.5, rh * 0.12);
+    // drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    roundRect(-rw / 2 + 2, -rh / 2 + 3, rw, rh, rw * 0.35); ctx.fill();
+    // metallic hull
+    const hull = ctx.createLinearGradient(-rw / 2, 0, rw / 2, 0);
+    hull.addColorStop(0, '#31435f'); hull.addColorStop(0.5, '#141c2c'); hull.addColorStop(1, '#0a0f18');
+    ctx.fillStyle = hull;
+    roundRect(-rw / 2, -rh / 2, rw, rh, rw * 0.35); ctx.fill();
+    ctx.strokeStyle = '#03060c'; ctx.lineWidth = 2;
+    roundRect(-rw / 2, -rh / 2, rw, rh, rw * 0.35); ctx.stroke();
+    // luminous strip along the inner edge (facing the tunnel)
+    ctx.strokeStyle = `rgba(${cCol},0.95)`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-rw * 0.36, -rh * 0.38); ctx.lineTo(-rw * 0.36, rh * 0.38); ctx.stroke();
+    ctx.strokeStyle = `rgba(${cCol},0.35)`; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(rw * 0.3, -rh * 0.34); ctx.lineTo(rw * 0.3, rh * 0.34); ctx.stroke();
+    // energy core window
+    const cg2 = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 0.42);
+    cg2.addColorStop(0, '#ffffff');
+    cg2.addColorStop(0.5, `rgba(${cCol},0.95)`);
+    cg2.addColorStop(1, `rgba(${cCol},0.15)`);
+    ctx.fillStyle = cg2;
+    ctx.beginPath(); ctx.arc(0, 0, size * 0.42, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(240,252,255,0.8)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, 0, size * 0.3, 0, TAU); ctx.stroke();
+    // running lights at both ends
+    ctx.fillStyle = `rgba(${cCol},0.95)`;
+    ctx.beginPath(); ctx.arc(0, -rh * 0.42, 2.5, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, rh * 0.42, 2.5, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawDials() {
+  for (let i = 0; i < 2; i++) {
+    const side = i === 0 ? 'L' : 'R';
+    const d = dialCenter(side);
+    const n = nodes[i];
+    ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, TAU);
+    ctx.strokeStyle = i === 0 ? 'rgba(77,141,255,0.85)' : 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, TAU);
+    ctx.fillStyle = 'rgba(10,20,45,0.35)'; ctx.fill();
+    // knob
+    const kx = d.x + Math.cos(n.angle) * d.r, ky = d.y + Math.sin(n.angle) * d.r;
+    const ks = d.r * 0.3;
+    const gl = ctx.createRadialGradient(kx, ky, 0, kx, ky, ks * 2);
+    gl.addColorStop(0, i === 0 ? 'rgba(77,141,255,0.6)' : 'rgba(255,255,255,0.55)');
+    gl.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gl;
+    ctx.beginPath(); ctx.arc(kx, ky, ks * 2, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(kx, ky, ks, 0, TAU);
+    ctx.fillStyle = n.color; ctx.fill();
+    ctx.strokeStyle = i === 0 ? '#7db2ff' : '#9fc4e0'; ctx.lineWidth = 2; ctx.stroke();
+    // radar blips: live enemy positions — angle matches the tunnel, radius = how close they are
+    for (const en of enemies) {
+      if (en.dead || en.resolved) continue;
+      const rr = d.r * (1 - clamp(en.z, 0, 1) * 0.85);
+      const bx = d.x + Math.cos(en.angle) * rr, by = d.y + Math.sin(en.angle) * rr;
+      const bs = 2.5 + (1 - en.z) * 4;
+      const urgent = en.z < 0.35 && Math.sin(time * 10) > 0; // blink when close
+      ctx.fillStyle = en.crawler
+        ? `rgba(255,140,40,${urgent || en.z >= 0.35 ? 0.95 : 0.4})`
+        : `rgba(220,50,50,${urgent || en.z >= 0.35 ? 0.95 : 0.4})`;
+      ctx.fillRect(bx - bs / 2, by - bs / 2, bs, bs);
+    }
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHUD(g) {
+  const L = LEVELS[levelIdx];
+  const pad = 14;
+
+  // level intro title — fades out as the run begins
+  if (levelT < 2.4) {
+    const a = levelT < 1.8 ? 1 : (2.4 - levelT) / 0.6;
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = a;
+    try { ctx.letterSpacing = '5px'; } catch (e) {}
+    ctx.fillStyle = 'rgba(200,235,255,0.8)'; ctx.font = '600 12px system-ui';
+    ctx.fillText('LEVEL ' + (levelIdx + 1), W / 2, H * 0.16);
+    ctx.fillStyle = '#eafaff'; ctx.font = '800 ' + Math.min(W * 0.045, 26) + 'px system-ui';
+    ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 18;
+    ctx.fillText(L.name, W / 2, H * 0.16 + 30);
+    ctx.shadowBlur = 0;
+    try { ctx.letterSpacing = '0px'; } catch (e) {}
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+  }
+
+  // left curved bar: LEVEL PROGRESS (green, hugs the node ring like the mock)
+  const barR = g.nodeR + Math.min(W, H) * 0.095;
+  const bw2 = Math.max(9, Math.min(W, H) * 0.024);
+  const aL0 = Math.PI * 1.06, aL1 = Math.PI * 1.38; // lower-left → upper-left
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(240,250,255,0.85)'; ctx.lineWidth = bw2 + 5;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
+  ctx.strokeStyle = '#050a12'; ctx.lineWidth = bw2 + 2;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
+  const prog = clamp(levelT / L.duration, 0, 1);
+  if (prog > 0.005) {
+    ctx.strokeStyle = '#7ee262';
+    ctx.lineWidth = bw2 - 4;
+    ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL0 + (aL1 - aL0) * prog); ctx.stroke();
+  }
+
+  // right curved bar: 4 life blocks joined into one bar — no outline, just the blocks
+  const MAXM = 4, blocksLeft = Math.max(0, Math.ceil(integrity / 25));
+  const aR0 = -Math.PI * 0.06, aR1 = -Math.PI * 0.38; // mirrored: lower-right → upper-right
+  const span = (aR0 - aR1) / MAXM, gap2 = span * 0.07; // thin seams keep them reading as one bar
+  ctx.lineCap = 'butt';
+  for (let i = 0; i < MAXM; i++) {
+    const s0 = aR0 - (i + 1) * span + gap2 / 2, s1 = aR0 - i * span - gap2 / 2;
+    if (i < blocksLeft) {
+      ctx.strokeStyle = '#8fc7ff'; ctx.lineWidth = bw2;
+      ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, s0, s1); ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(15,28,48,0.8)'; ctx.lineWidth = bw2;
+      ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, s0, s1); ctx.stroke();
+    }
+  }
+  ctx.lineCap = 'round';
+
+  // score (right)
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#ffd24a'; ctx.font = '700 20px system-ui';
+  ctx.fillText(score.toLocaleString(), W - pad, H * 0.12 + 8);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '600 10px system-ui';
+  ctx.fillText('SCORE', W - pad, H * 0.12 + 24);
+  if (combo >= 3) {
+    ctx.fillStyle = '#ffd24a'; ctx.font = '700 14px system-ui';
+    ctx.fillText('COMBO x' + Math.min(combo, 5), W - pad, H * 0.12 + 48);
+  }
+  ctx.textAlign = 'left';
+
+  // pause button (top-left)
+  pauseBtnRect = { x: 12, y: 12, w: 38, h: 38 };
+  roundRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 10);
+  ctx.fillStyle = 'rgba(10,20,45,0.55)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(120,170,255,0.45)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = 'rgba(230,242,255,0.9)';
+  ctx.fillRect(pauseBtnRect.x + 12, pauseBtnRect.y + 11, 5, 16);
+  ctx.fillRect(pauseBtnRect.x + 21, pauseBtnRect.y + 11, 5, 16);
+}
+
+function drawPause() {
+  pauseButtonsList = []; pauseSlidersList = []; pauseTogglesList = [];
+  ctx.fillStyle = 'rgba(3,6,14,0.78)'; ctx.fillRect(0, 0, W, H);
+  const pw = Math.min(W * 0.74, 540), ph = Math.min(H * 0.84, 320);
+  const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+  roundRect(px, py, pw, ph, 18);
+  ctx.fillStyle = 'rgba(8,16,36,0.96)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(90,160,255,0.45)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.fillStyle = '#eaf4ff'; ctx.font = '800 22px system-ui';
+  ctx.fillText('PAUSED', W / 2, py + 38);
+
+  function settingRow(label, key, volKey, y) {
+    ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = '700 13px system-ui';
+    ctx.fillText(label, px + 24, y + 5);
+    // toggle pill
+    const tx = px + 92, tw = 52, th = 26, on = settings[key];
+    roundRect(tx, y - th / 2, tw, th, th / 2);
+    ctx.fillStyle = on ? '#2461d9' : 'rgba(255,255,255,0.15)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(tx + (on ? tw - th / 2 : th / 2), y, th / 2 - 3, 0, TAU);
+    ctx.fillStyle = '#fff'; ctx.fill();
+    pauseTogglesList.push({ x: tx, y: y - th / 2, w: tw, h: th, key });
+    // volume slider
+    const sx = tx + tw + 26, sw2 = px + pw - 36 - sx;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2, y); ctx.stroke();
+    const v = settings[volKey];
+    ctx.strokeStyle = on ? '#4d8dff' : 'rgba(120,150,200,0.35)';
+    ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2 * v, y); ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx + sw2 * v, y, 9, 0, TAU);
+    ctx.fillStyle = on ? '#fff' : 'rgba(200,210,230,0.5)'; ctx.fill();
+    pauseSlidersList.push({ x: sx, y, w: sw2, key: volKey });
+  }
+  settingRow('SFX',   'sound', 'soundVol', py + 78);
+  settingRow('MUSIC', 'music', 'musicVol', py + 128);
+
+  const bh = 46, gap = 12, bw = (pw - 48 - gap * 2) / 3;
+  let bx = px + 24; const by = py + ph - bh - 24;
+  [['RESUME', 'resume', true], ['RESTART', 'restart', false], ['QUIT', 'menu', false]].forEach(([label, action, primary]) => {
+    button(bx, by, bw, bh, label, primary);
+    pauseButtonsList.push({ x: bx, y: by, w: bw, h: bh, action });
+    bx += bw + gap;
+  });
+  ctx.textAlign = 'left';
+}
+
+function pauseTap(x, y, pid) {
+  for (const t of pauseTogglesList) {
+    if (x > t.x - 8 && x < t.x + t.w + 8 && y > t.y - 8 && y < t.y + t.h + 8) {
+      settings[t.key] = !settings[t.key]; applySettings(); sfx.tick(); return;
+    }
+  }
+  for (const s of pauseSlidersList) {
+    if (x > s.x - 14 && x < s.x + s.w + 14 && Math.abs(y - s.y) < 20) {
+      settings[s.key] = clamp((x - s.x) / s.w, 0, 1); applySettings();
+      pauseDrag[pid] = s; return;
+    }
+  }
+  for (const b of pauseButtonsList) {
+    if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
+      sfx.tick();
+      if (b.action === 'resume') state = S.PLAY;
+      else if (b.action === 'restart') startLevel(levelIdx);
+      else { state = S.MENU; playTrack('menu'); }
+      return;
+    }
+  }
+}
+
+function drawStars(cx, cy, count, size, t) {
+  for (let i = 0; i < 3; i++) {
+    const x = cx + (i - 1) * size * 2.6;
+    const on = i < count && t > 0.4 + i * 0.35;
+    ctx.save();
+    ctx.translate(x, cy);
+    const pop = on ? 1 + Math.max(0, 0.5 - (t - (0.4 + i * 0.35))) * 1.2 : 1;
+    ctx.scale(pop, pop);
+    ctx.beginPath();
+    for (let k = 0; k < 10; k++) {
+      const a = -Math.PI / 2 + k / 10 * TAU;
+      const r = k % 2 === 0 ? size : size * 0.45;
+      k === 0 ? ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    ctx.closePath();
+    ctx.fillStyle = on ? '#ffd24a' : 'rgba(255,255,255,0.15)';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function button(x, y, w, h, label, primary, locked) {
+  // Tron console button: dark slab, luminous edge
+  roundRect(x, y, w, h, 5);
+  ctx.fillStyle = locked ? 'rgba(255,255,255,0.05)' : primary ? 'rgba(24,90,140,0.85)' : 'rgba(6,14,24,0.85)';
+  ctx.fill();
+  if (!locked) {
+    ctx.strokeStyle = primary ? 'rgba(160,240,255,0.35)' : 'rgba(120,225,255,0.18)';
+    ctx.lineWidth = 5;
+    roundRect(x, y, w, h, 5); ctx.stroke();
+    ctx.strokeStyle = primary ? '#a8ecff' : 'rgba(120,225,255,0.75)';
+    ctx.lineWidth = 1.5;
+    roundRect(x, y, w, h, 5); ctx.stroke();
+  }
+  ctx.fillStyle = locked ? 'rgba(255,255,255,0.25)' : primary ? '#eefaff' : '#bfeaff';
+  try { ctx.letterSpacing = '2px'; } catch (e) {}
+  ctx.font = '600 14px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w / 2, y + h / 2 + 1);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+}
+
+function drawMenu(g) {
+  menuButtons = [];
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#eafaff';
+  try { ctx.letterSpacing = '8px'; } catch (e) {}
+  ctx.font = '800 ' + Math.min(W * 0.085, 42) + 'px system-ui';
+  ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 30;
+  ctx.fillText('DATA DEFENDERS', W / 2, H * 0.2);
+  ctx.shadowBlur = 0;
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.strokeStyle = 'rgba(120,225,255,0.5)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(W / 2 - W * 0.18, H * 0.2 + 10); ctx.lineTo(W / 2 + W * 0.18, H * 0.2 + 10); ctx.stroke();
+  ctx.fillStyle = 'rgba(180,215,255,0.8)'; ctx.font = '500 13px system-ui';
+  ctx.fillText('Guard the payload. Zap the data traps.', W / 2, H * 0.2 + 28);
+  ctx.fillStyle = 'rgba(180,215,255,0.55)'; ctx.font = '500 12px system-ui';
+  ctx.fillText('Left thumb = blue node · Right thumb = white node', W / 2, H * 0.2 + 48);
+  ctx.fillText('Slide around the dials to intercept traps on the tunnel rim', W / 2, H * 0.2 + 66);
+
+  const bw = Math.min(W * 0.68, 320), bh = isLandscape() ? 46 : 52;
+  const gap = isLandscape() ? 10 : 16, startY = isLandscape() ? H * 0.42 : H * 0.38;
+  for (let i = 0; i < LEVELS.length; i++) {
+    const bx = W / 2 - bw / 2, by = startY + i * (bh + gap);
+    const locked = i + 1 > progress.unlocked;
+    button(bx, by, bw, bh, (locked ? '🔒 ' : '') + (i + 1) + '.  ' + LEVELS[i].name, i + 1 === progress.unlocked, locked);
+    if (progress.stars[i] > 0) {
+      ctx.textAlign = 'center'; ctx.fillStyle = '#ffd24a'; ctx.font = '13px system-ui';
+      ctx.fillText('★'.repeat(progress.stars[i]) + '☆'.repeat(3 - progress.stars[i]), bx + bw / 2, by + bh + 2);
+    }
+    menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
+  }
+  ctx.textAlign = 'left';
+}
+
+function drawEnd(g) {
+  endButtons = [];
+  ctx.fillStyle = 'rgba(3,6,14,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = endWin ? '#69e05c' : '#ff4a5e';
+  ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
+  ctx.fillText(endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25);
+
+  if (endWin) drawStars(W / 2, H * 0.35, endStars, Math.min(W, H) * 0.045, endT);
+
+  ctx.fillStyle = '#eaf4ff'; ctx.font = '700 26px system-ui';
+  ctx.fillText(score.toLocaleString(), W / 2, H * 0.47);
+  ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = '500 12px system-ui';
+  ctx.fillText('SCORE', W / 2, H * 0.47 + 20);
+  ctx.fillText('Zapped ' + zaps + '   ·   Missed ' + misses + '   ·   Integrity ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
+
+  // build button list, then lay out: row in landscape, stack in portrait
+  const list = [];
+  if (endWin && levelIdx + 1 < LEVELS.length) list.push({ label: 'NEXT LEVEL ▸', action: 'next', primary: true });
+  list.push({ label: endWin ? 'REPLAY' : 'RETRY', action: 'retry', primary: !endWin });
+  list.push({ label: 'MENU', action: 'menu', primary: false });
+  const bh = 50;
+  if (isLandscape()) {
+    const bw = Math.min(W * 0.24, 210), gap = 16;
+    const total = list.length * bw + (list.length - 1) * gap;
+    let bx = W / 2 - total / 2;
+    const by = H * 0.66;
+    for (const b of list) {
+      button(bx, by, bw, bh, b.label, b.primary);
+      endButtons.push({ x: bx, y: by, w: bw, h: bh, action: b.action });
+      bx += bw + gap;
+    }
+  } else {
+    const bw = Math.min(W * 0.6, 260);
+    let by = H * 0.62;
+    for (const b of list) {
+      button(W / 2 - bw / 2, by, bw, bh, b.label, b.primary);
+      endButtons.push({ x: W / 2 - bw / 2, y: by, w: bw, h: bh, action: b.action });
+      by += bh + 14;
+    }
+  }
+  ctx.textAlign = 'left';
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-1, 1) * shake * 6, rand(-1, 1) * shake * 6);
+
+  // background
+  ctx.clearRect(-20, -20, W + 40, H + 40);
+  if (bgCanvas) ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawLiveBg(dt);
+
+  const g = geo();
+
+  // the tunnel fills the whole screen — no clipping, we're inside it
+  drawTunnel(g);
+  drawWallCode(g, dt);
+  drawStreaks(g, dt);
+  // warm glow rising off the golden river
+  const rgl = ctx.createRadialGradient(g.cx, H * 0.95, 0, g.cx, H * 0.95, Math.min(W, H) * 0.75);
+  rgl.addColorStop(0, 'rgba(255,180,70,0.12)');
+  rgl.addColorStop(1, 'rgba(255,180,70,0)');
+  ctx.fillStyle = rgl;
+  ctx.fillRect(0, 0, W, H);
+
+  // atmospheric depth fog — mid-distance haze inside the tunnel
+  const fogG = ctx.createRadialGradient(g.cx, g.cy, g.nodeR * 0.1, g.cx, g.cy, g.nodeR * 1.4);
+  fogG.addColorStop(0, 'rgba(10,22,48,0)');
+  fogG.addColorStop(0.45, 'rgba(10,22,48,0.12)');
+  fogG.addColorStop(1, 'rgba(10,22,48,0)');
+  ctx.fillStyle = fogG;
+  ctx.fillRect(0, 0, W, H);
+
+  // node holder ring: thick matte black like the mock, with faked soft shadow for depth
+  const bz = Math.min(W, H) * 0.055;
+  ctx.strokeStyle = 'rgba(0,0,0,0.10)'; ctx.lineWidth = bz * 3.0;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = bz * 2.2;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = 'rgba(0,0,0,0.22)'; ctx.lineWidth = bz * 1.6;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, 0, TAU);
+  ctx.strokeStyle = 'rgba(3,6,11,0.96)'; ctx.lineWidth = bz; ctx.stroke();
+  // cold specular catch on the upper-left of the ring
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz - 1.5, Math.PI * 0.95, Math.PI * 1.55);
+  ctx.strokeStyle = 'rgba(180,230,255,0.30)'; ctx.lineWidth = 2; ctx.stroke();
+  // warm river light reflecting off the ring's lower edge
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + 1.5, Math.PI * 0.28, Math.PI * 0.72);
+  ctx.strokeStyle = 'rgba(255,190,100,0.28)'; ctx.lineWidth = 2.5; ctx.stroke();
+  // maglev rails on the ring's inner face — the node carriages ride these
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR - bz * 0.62, 0, TAU);
+  ctx.strokeStyle = 'rgba(120,220,255,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR - bz * 1.1, 0, TAU);
+  ctx.strokeStyle = 'rgba(120,220,255,0.20)'; ctx.lineWidth = 1; ctx.stroke();
+
+  // traps render over the ring — missed ones fly past the player and fade
+  const sorted = enemies.slice().sort((a, b) => b.z - a.z);
+  for (const en of sorted) drawEnemy(en, g);
+
+  if (state !== S.MENU) drawNodes(g);
+
+  // particles + popups (over everything)
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  for (const p of popups) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.color; ctx.font = '700 15px system-ui';
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1; ctx.textAlign = 'left';
+
+  // cinematic vignette + color grade (under the HUD so controls stay crisp)
+  if (vignetteCanvas) ctx.drawImage(vignetteCanvas, 0, 0, W, H);
+  const grade = ctx.createLinearGradient(0, 0, 0, H);
+  grade.addColorStop(0, 'rgba(18,55,110,0.10)');   // cool up top
+  grade.addColorStop(0.55, 'rgba(0,0,0,0)');
+  grade.addColorStop(1, 'rgba(255,150,50,0.08)');  // warm river light below
+  ctx.fillStyle = grade;
+  ctx.fillRect(0, 0, W, H);
+
+  if (state === S.PLAY) { drawHUD(g); drawDials(); }
+  else if (state === S.PAUSE) { drawHUD(g); drawDials(); drawPause(); }
+  else if (state === S.MENU) drawMenu(g);
+  else drawEnd(g);
+
+  // red damage vignette
+  if (redFlash > 0) {
+    const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.7);
+    v.addColorStop(0, 'rgba(255,40,60,0)');
+    v.addColorStop(1, `rgba(255,40,60,${(redFlash * 0.4).toFixed(2)})`);
+    ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  }
+
+  ctx.restore();
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
