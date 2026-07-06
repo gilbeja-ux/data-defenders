@@ -443,7 +443,7 @@ let endless = false, LV = null, runTrack = 0; // active run config + its soundtr
 let menuScroll = 0, menuPtr = null; // level-list scrolling
 let endWin = false, endStars = 0, endT = 0;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
-let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null;
+let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null, menuFsRect = null;
 const pauseDrag = {};
 
 // nodes: [left(blue), right(white)]
@@ -581,12 +581,30 @@ function dialCenter(side) {
 // touch so exiting fullscreen (or a failed first attempt) recovers on the next tap.
 // Works on Android Chrome; iPhone Safari has no element fullscreen — there the
 // home-screen standalone mode is the fullscreen path.
+const inStandalone = () =>
+  (window.matchMedia && window.matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches) ||
+  navigator.standalone;
+function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      return;
+    }
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req) { popup(W / 2, H * 0.32, 'FULLSCREEN NOT SUPPORTED IN THIS BROWSER', '#ff9a3c'); return; }
+    const fs = req.call(el);
+    if (fs && fs.then) {
+      fs.then(() => {
+        if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
+      }).catch(err => popup(W / 2, H * 0.32, 'FULLSCREEN BLOCKED: ' + ((err && err.name) || err), '#ff9a3c'));
+    }
+  } catch (e) { popup(W / 2, H * 0.32, 'FULLSCREEN ERROR: ' + (e.name || e), '#ff9a3c'); }
+}
 function tryLockLandscape() {
   try {
     if (document.fullscreenElement || document.webkitFullscreenElement) return;
-    // standalone/installed PWA is already chromeless — don't fight it
-    if ((window.matchMedia && window.matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches) ||
-        window.navigator.standalone) return;
+    if (inStandalone()) return; // installed PWA is already chromeless — don't fight it
     const el = document.documentElement;
     const req = el.requestFullscreen || el.webkitRequestFullscreen;
     if (!req) return;
@@ -606,8 +624,8 @@ canvas.addEventListener('pointerdown', e => {
   const P = evPos(e);
   if (state === S.MENU) {
     // overlay + gear act immediately; the level list uses tap-vs-drag on release
-    if (menuSettings || (menuGearRect && P.x > menuGearRect.x - 8 && P.x < menuGearRect.x + menuGearRect.w + 8 &&
-        P.y > menuGearRect.y - 8 && P.y < menuGearRect.y + menuGearRect.h + 8)) {
+    const hitRect = (r, m) => r && P.x > r.x - m && P.x < r.x + r.w + m && P.y > r.y - m && P.y < r.y + r.h + m;
+    if (menuSettings || hitRect(menuGearRect, 8) || hitRect(menuFsRect, 6)) {
       menuTap(P.x, P.y, e.pointerId);
       return;
     }
@@ -702,6 +720,10 @@ function menuTap(x, y, pid) {
       menuSettings = false; sfx.tick();
     }
     return;
+  }
+  if (menuFsRect && x > menuFsRect.x - 6 && x < menuFsRect.x + menuFsRect.w + 6 &&
+      y > menuFsRect.y - 6 && y < menuFsRect.y + menuFsRect.h + 6) {
+    toggleFullscreen(); sfx.tick(); return;
   }
   if (menuGearRect && x > menuGearRect.x - 8 && x < menuGearRect.x + menuGearRect.w + 8 &&
       y > menuGearRect.y - 8 && y < menuGearRect.y + menuGearRect.h + 8) {
@@ -2093,6 +2115,25 @@ function drawMenu(g) {
   ctx.fillStyle = 'rgba(120,210,255,0.5)';
   ctx.fillText(String(Math.floor(44589 + time * 12.4) % 100000).padStart(5, '0'), W - 20, H - 34);
   ctx.fillText(String(Math.floor(45895 + time * 31.7) % 100000).padStart(5, '0'), W - 20, H - 22);
+
+  // fullscreen key (left of the gear; hidden when already chromeless)
+  menuFsRect = null;
+  if (!inStandalone() && !(document.fullscreenElement || document.webkitFullscreenElement)) {
+    menuFsRect = { x: W - 96 - SAFE.r, y: 12 + SAFE.t, w: 38, h: 38 };
+    const f = menuFsRect;
+    techRect(f.x, f.y, f.w, f.h, 8);
+    ctx.fillStyle = 'rgba(6,20,40,0.6)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(120,220,255,0.55)'; ctx.lineWidth = 1.5;
+    techRect(f.x, f.y, f.w, f.h, 8); ctx.stroke();
+    // expand-arrows icon
+    ctx.strokeStyle = 'rgba(200,240,255,0.9)'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    for (const [cx2, cy2, dx, dy] of [[f.x + 11, f.y + 11, -1, -1], [f.x + 27, f.y + 11, 1, -1], [f.x + 11, f.y + 27, -1, 1], [f.x + 27, f.y + 27, 1, 1]]) {
+      ctx.beginPath();
+      ctx.moveTo(cx2 + dx * 3, cy2 + dy * 3); ctx.lineTo(cx2 - dx * 2, cy2 + dy * 3);
+      ctx.moveTo(cx2 + dx * 3, cy2 + dy * 3); ctx.lineTo(cx2 + dx * 3, cy2 - dy * 2);
+      ctx.stroke();
+    }
+  }
 
   // audio config key (top-right)
   menuGearRect = { x: W - 50 - SAFE.r, y: 12 + SAFE.t, w: 38, h: 38 };
