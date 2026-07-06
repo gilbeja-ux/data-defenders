@@ -72,7 +72,7 @@ const rand = (a, b) => a + Math.random() * (b - a);
 
 // ---------- audio ----------
 let AC = null, sfxGain = null;
-const settings = { sound: true, soundVol: 0.8, music: true, musicVol: 0.5 };
+const settings = { sound: true, soundVol: 0.8, music: true, musicVol: 0.5, haptics: true };
 function applySettings() {
   saveState();
   if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
@@ -90,7 +90,7 @@ function audio() {
   initAC();
   if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
   // (re)start the right track — every audio() call originates from a user gesture
-  playTrack(state === S.PLAY || state === S.PAUSE ? trackForLevel(levelIdx) : 'menu');
+  playTrack(state === S.PLAY || state === S.PAUSE ? runTrack : 'menu');
   return AC;
 }
 function tone(freq, dur, type, vol, slideTo, dest) {
@@ -160,8 +160,24 @@ function updateMusic(dt) {
   const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
   musicGain.gain.value = musicVolume() * f;
 }
+// haptics: Capacitor Haptics on device, vibration API on the web
+function buzz(pattern) {
+  if (!settings.haptics) return;
+  const cap = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Haptics;
+  try {
+    if (cap) {
+      if (Array.isArray(pattern)) cap.vibrate({ duration: pattern.reduce((a, b) => a + b, 0) });
+      else cap.impact({ style: pattern >= 30 ? 'Heavy' : pattern >= 20 ? 'Medium' : 'Light' });
+    } else if (navigator.vibrate) navigator.vibrate(pattern);
+  } catch (e) {}
+}
 const sfx = {
-  zap()  { tone(880, 0.12, 'square', 0.10, 220); tone(1760, 0.08, 'sawtooth', 0.05, 440); },
+  zap(combo) { // pitch climbs with the combo — every zap in a streak sounds sweeter
+    const m = Math.pow(1.059, Math.min(combo || 1, 12));
+    tone(880 * m, 0.12, 'square', 0.10, 220 * m);
+    tone(1760 * m, 0.08, 'sawtooth', 0.05, 440 * m);
+  },
+  pick() { tone(660, 0.09, 'triangle', 0.12, 880); tone(1320, 0.14, 'triangle', 0.10, 1760); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
   win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
   fail() { [330, 262, 196].forEach((f, i) => setTimeout(() => tone(f, 0.3, 'sawtooth', 0.1), i * 180)); },
@@ -347,13 +363,39 @@ function drawWallCode(g, dt) {
 
 // ---------- levels ----------
 const LEVELS = [
-  { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.5, spawnMax: 2.3, speed: 0.34, doubles: 0.00, crawlers: 0.00, heavies: 0.00, lines: 0.00 },
-  { name: 'CITY GRID',      duration: 55, spawnMin: 1.0, spawnMax: 1.8, speed: 0.42, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00,
+  { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.50, spawnMax: 2.30, speed: 0.34, doubles: 0.00, crawlers: 0.00, heavies: 0.00, lines: 0.00, colors: 0.00, track: 0 },
+  { name: 'CITY GRID',      duration: 50, spawnMin: 1.05, spawnMax: 1.80, speed: 0.40, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00, colors: 0.00, track: 1,
     hint: 'NEW THREAT: heavy traps — pin them with BOTH nodes' },
-  { name: 'GLOBAL BACKBONE',duration: 70, spawnMin: 0.75,spawnMax: 1.5, speed: 0.50, doubles: 0.40, crawlers: 0.35, heavies: 0.22, lines: 0.22,
-    hint: 'NEW THREAT: barrier lines — one node on each end' }
+  { name: 'METRO EXCHANGE', duration: 55, spawnMin: 0.95, spawnMax: 1.70, speed: 0.43, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00, colors: 0.00, track: 2, bursts: true,
+    hint: 'NEW THREAT: burst transmissions — traps arrive in volleys' },
+  { name: 'GLOBAL BACKBONE',duration: 60, spawnMin: 0.85, spawnMax: 1.55, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, track: 0,
+    hint: 'NEW THREAT: barrier lines — one node on each end' },
+  { name: 'DEEP FIBER',     duration: 60, spawnMin: 0.80, spawnMax: 1.50, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, track: 1, waves: true,
+    hint: 'NEW THREAT: speed waves — the stream surges and slows' },
+  { name: 'QUANTUM RELAY',  duration: 65, spawnMin: 0.80, spawnMax: 1.45, speed: 0.48, doubles: 0.35, crawlers: 0.30, heavies: 0.18, lines: 0.18, colors: 0.35, track: 2,
+    hint: 'NEW THREAT: color-locked traps — match the node color' },
+  { name: 'DARKNET EDGE',   duration: 70, spawnMin: 0.68, spawnMax: 1.30, speed: 0.54, doubles: 0.40, crawlers: 0.35, heavies: 0.22, lines: 0.22, colors: 0.30, track: 0, bursts: true, waves: true,
+    hint: 'ALL THREATS ACTIVE — maximum traffic' },
+  { name: 'CORE FIREWALL',  duration: 45, spawnMin: 0.90, spawnMax: 1.60, speed: 0.50, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.30, track: 2, boss: true,
+    hint: 'THE FIREWALL CORE AWAITS — drain it with your nodes' }
 ];
-const progress = { unlocked: 1, stars: [0, 0, 0] };
+const ramp = (a, b, x) => lerp(a, b, clamp(x, 0, 1));
+// endless mode: difficulty is a function of survival time, rebuilt each frame
+function endlessCfg(t) {
+  const k = clamp(t / 150, 0, 1); // fully spiced after 2.5 minutes
+  return {
+    name: 'ENDLESS STREAM', duration: Infinity, endless: true,
+    spawnMin: ramp(1.4, 0.55, k), spawnMax: ramp(2.2, 1.1, k),
+    speed: ramp(0.36, 0.60, k),
+    doubles: ramp(0, 0.40, k),
+    crawlers: ramp(0, 0.35, (k - 0.2) / 0.8),
+    heavies: ramp(0, 0.22, (k - 0.15) / 0.85),
+    lines: ramp(0, 0.22, (k - 0.3) / 0.7),
+    colors: ramp(0, 0.30, (k - 0.45) / 0.55),
+    bursts: t > 70, waves: t > 100
+  };
+}
+const progress = { unlocked: 1, stars: [0, 0, 0, 0, 0, 0, 0, 0], tutorialDone: false, best: 0 };
 
 // ---------- persistence ----------
 const STORE_KEY = 'dataDefenders.v1';
@@ -366,6 +408,7 @@ function saveState() {
     if (d) {
       if (d.progress) Object.assign(progress, d.progress);
       if (d.settings) Object.assign(settings, d.settings);
+      while (progress.stars.length < LEVELS.length) progress.stars.push(0); // older saves had fewer levels
     }
   } catch (e) {}
 })();
@@ -378,6 +421,15 @@ let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0;
 let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
+let hitStop = 0;              // brief slow-mo after a zap
+let bolts = [];               // lightning arcs (node → trap)
+const fx = { slow: 0, wide: 0, auto: 0 }; // power-up effect timers (seconds)
+let pickups = [], pickupT = 20;
+let tut = null;               // tutorial controller (level 1, first run)
+let boss = null;              // firewall core (levels with boss: true)
+let burstQ = null;            // pending burst-volley spawns
+let endless = false, LV = null, runTrack = 0; // active run config + its soundtrack
+let menuScroll = 0, menuPtr = null; // level-list scrolling
 let endWin = false, endStars = 0, endT = 0;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
 let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null;
@@ -418,8 +470,11 @@ function ring(z, g) {
 function spawnEnemy(forcedAngle, type) {
   type = type || 'normal';
   const heavy = type === 'heavy';
-  const L = LEVELS[levelIdx];
+  const L = LV || LEVELS[levelIdx];
   const crawler = type === 'normal' && Math.random() < L.crawlers;
+  // color-locked traps only answer to one node: 0 = blue (left), 1 = white (right)
+  const lock = type === 'normal' && !crawler && Math.random() < (L.colors || 0)
+    ? (Math.random() < 0.5 ? 0 : 1) : undefined;
   // per-enemy iridescent crystal cluster + dense branching filaments (stable random shapes)
   const shards = [];
   const nS = (heavy ? 15 : 11) + (Math.random() * 4 | 0);
@@ -435,7 +490,7 @@ function spawnEnemy(forcedAngle, type) {
     });
   }
   const en = {
-    type, z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
+    type, lock, z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
     drift: crawler ? (Math.random() < 0.5 ? 1 : -1) * rand(0.25, 0.5) : 0,
     crawler, sizeMul: heavy ? 1.6 : 1, speedMul: heavy ? 0.82 : 1,
     spin: Math.random() * TAU, dead: false, shards, tendrils, partner: null
@@ -455,8 +510,15 @@ function spawnLine() {
 function trySpawn(dt) {
   spawnT -= dt;
   if (spawnT <= 0) {
-    const L = LEVELS[levelIdx];
+    const L = LV || LEVELS[levelIdx];
     spawnT = rand(L.spawnMin, L.spawnMax);
+    // burst transmissions: occasionally a volley of three in rapid succession
+    if (L.bursts && !burstQ && Math.random() < 0.3) {
+      burstQ = { left: 2, t: 0.35 };
+      spawnEnemy();
+      spawnT += 0.9; // breathe after a volley
+      return;
+    }
     const roll = Math.random();
     if (roll < L.lines) { spawnLine(); return; }
     if (roll < L.lines + L.heavies) { spawnEnemy(undefined, 'heavy'); return; }
@@ -464,6 +526,23 @@ function trySpawn(dt) {
     spawnEnemy(a);
     if (Math.random() < L.doubles) spawnEnemy(a + Math.PI + rand(-0.6, 0.6));
   }
+}
+// golden power-up orbs riding the stream; catch one with either node
+const PICKUPS = {
+  slow: { dur: 6,  label: 'SLOW-MO' },
+  wide: { dur: 10, label: 'WIDE ARC' },
+  auto: { dur: 5,  label: 'AUTO-ZAP' }
+};
+function spawnPickup() {
+  const kinds = Object.keys(PICKUPS);
+  pickups.push({ kind: kinds[(Math.random() * kinds.length) | 0], z: 1.12, angle: Math.random() * TAU, spin: 0, done: false });
+}
+// the firewall core: parks at the ring and must be drained by node coverage
+function spawnBoss() {
+  boss = {
+    hp: 8, maxHp: 8, z: 1.12, angle: Math.random() * TAU, spin: 0,
+    drift: 0.22, retarget: 3, minionT: 3.5, cd: [0, 0], flash: 0
+  };
 }
 
 // ---------- particles ----------
@@ -505,7 +584,16 @@ canvas.addEventListener('pointerdown', e => {
   audio();
   if (e.pointerType === 'touch') tryLockLandscape();
   const P = evPos(e);
-  if (state === S.MENU) { menuTap(P.x, P.y, e.pointerId); return; }
+  if (state === S.MENU) {
+    // overlay + gear act immediately; the level list uses tap-vs-drag on release
+    if (menuSettings || (menuGearRect && P.x > menuGearRect.x - 8 && P.x < menuGearRect.x + menuGearRect.w + 8 &&
+        P.y > menuGearRect.y - 8 && P.y < menuGearRect.y + menuGearRect.h + 8)) {
+      menuTap(P.x, P.y, e.pointerId);
+      return;
+    }
+    menuPtr = { id: e.pointerId, x: P.x, y: P.y, scroll0: menuScroll, moved: false };
+    return;
+  }
   if (state === S.END)  { endTap(P.x, P.y); return; }
   if (state === S.PAUSE) { pauseTap(P.x, P.y, e.pointerId); return; }
   // pause button (generous hit area)
@@ -520,6 +608,12 @@ canvas.addEventListener('pointerdown', e => {
 });
 canvas.addEventListener('pointermove', e => {
   const P = evPos(e);
+  if (menuPtr && menuPtr.id === e.pointerId && state === S.MENU && !menuSettings) {
+    const dy = P.y - menuPtr.y;
+    if (Math.abs(dy) > 6) menuPtr.moved = true;
+    menuScroll = clamp(menuPtr.scroll0 - dy, 0, menuGeom().maxScroll);
+    return;
+  }
   const sl = pauseDrag[e.pointerId];
   if (sl && (state === S.PAUSE || (state === S.MENU && menuSettings))) {
     settings[sl.key] = clamp((P.x - sl.x) / sl.w, 0, 1);
@@ -534,8 +628,22 @@ canvas.addEventListener('pointermove', e => {
   nodes[p.side === 'L' ? 0 : 1].angle += delta; // 1:1, zero-lag: node mirrors the thumb exactly
 });
 function releasePointer(e) { delete pointers[e.pointerId]; delete pauseDrag[e.pointerId]; }
-canvas.addEventListener('pointerup', releasePointer);
-canvas.addEventListener('pointercancel', releasePointer);
+canvas.addEventListener('pointerup', e => {
+  if (menuPtr && menuPtr.id === e.pointerId) {
+    const P = evPos(e);
+    if (!menuPtr.moved && state === S.MENU && !menuSettings) menuTap(P.x, P.y, e.pointerId);
+    menuPtr = null;
+  }
+  releasePointer(e);
+});
+canvas.addEventListener('pointercancel', e => {
+  if (menuPtr && menuPtr.id === e.pointerId) menuPtr = null;
+  releasePointer(e);
+});
+// desktop: wheel scrolls the level list
+window.addEventListener('wheel', e => {
+  if (state === S.MENU && !menuSettings) menuScroll = clamp(menuScroll + e.deltaY * 0.5, 0, menuGeom().maxScroll);
+}, { passive: true });
 
 // keyboard fallback for desktop testing
 const keys = {};
@@ -581,7 +689,8 @@ function menuTap(x, y, pid) {
   }
   for (const b of menuButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h && !b.locked) {
-      startLevel(b.level); sfx.tick(); return;
+      if (b.endless) startEndless(); else startLevel(b.level);
+      sfx.tick(); return;
     }
   }
 }
@@ -590,7 +699,7 @@ function endTap(x, y) {
   for (const b of endButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
       sfx.tick();
-      if (b.action === 'retry') startLevel(levelIdx);
+      if (b.action === 'retry') { if (endless) startEndless(); else startLevel(levelIdx); }
       else if (b.action === 'next') startLevel(levelIdx + 1);
       else { state = S.MENU; playTrack('menu'); }
       return;
@@ -598,20 +707,38 @@ function endTap(x, y) {
   }
 }
 
-function startLevel(i) {
-  levelIdx = i; levelT = 0; spawnT = 1.2;
+function resetRun() {
+  levelT = 0; spawnT = 1.2;
   integrity = 100; score = 0; zaps = 0; misses = 0; combo = 0;
-  enemies = []; particles = []; popups = [];
+  enemies = []; particles = []; popups = []; bolts = []; pickups = [];
+  boss = null; burstQ = null; hitStop = 0;
+  fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
   nodes[0].angle = Math.PI * 0.75;
   nodes[1].angle = Math.PI * 0.25;
   state = S.PLAY;
-  playTrack(trackForLevel(i));
+}
+function startLevel(i) {
+  levelIdx = i; endless = false; LV = LEVELS[i];
+  tut = (i === 0 && !progress.tutorialDone) ? { step: 0, t: 0, respawn: null } : null;
+  resetRun();
+  runTrack = LV.track || 0;
+  playTrack(runTrack);
+}
+function startEndless() {
+  levelIdx = -1; endless = true; LV = endlessCfg(0); tut = null;
+  resetRun();
+  runTrack = (Math.random() * 3) | 0;
+  playTrack(runTrack);
 }
 
 function endLevel(win) {
   endWin = win; endT = 0;
-  endStars = win ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
-  if (win) {
+  endStars = win && !endless ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
+  if (endless) {
+    progress.best = Math.max(progress.best || 0, score);
+    saveState();
+    sfx.fail();
+  } else if (win) {
     progress.stars[levelIdx] = Math.max(progress.stars[levelIdx], endStars);
     progress.unlocked = Math.max(progress.unlocked, Math.min(levelIdx + 2, LEVELS.length));
     saveState();
@@ -621,6 +748,36 @@ function endLevel(win) {
 }
 
 // ---------- update ----------
+function spawnBolt(x1, y1, x2, y2) {
+  bolts.push({ x1, y1, x2, y2, life: 0.18, max: 0.18 });
+}
+// guided first run: one slow trap per thumb, no penalties, spawns held until done
+function updateTutorial(dt) {
+  tut.t += dt;
+  const alive = enemies.some(e => !e.dead && !e.resolved);
+  if (tut.respawn && !alive && tut.t > 0.8) { // missed the practice trap — try again
+    const side = tut.respawn; tut.respawn = null; tut.t = 0;
+    const en = spawnEnemy(side === 'L' ? Math.PI + rand(-0.4, 0.4) : rand(-0.4, 0.4), 'normal');
+    en.speedMul = 0.42; en.tut = side;
+    return;
+  }
+  if (tut.step === 0 && tut.t > 1.0) {
+    const en = spawnEnemy(Math.PI + rand(-0.4, 0.4), 'normal'); // left side
+    en.speedMul = 0.42; en.tut = 'L';
+    tut.step = 1; tut.t = 0;
+  } else if (tut.step === 1 && !alive && !tut.respawn) {
+    tut.step = 2; tut.t = 0;
+  } else if (tut.step === 2 && tut.t > 1.2) {
+    const en = spawnEnemy(rand(-0.4, 0.4), 'normal'); // right side
+    en.speedMul = 0.42; en.tut = 'R';
+    tut.step = 3; tut.t = 0;
+  } else if (tut.step === 3 && !alive && !tut.respawn) {
+    tut.step = 4; tut.t = 0;
+  } else if (tut.step === 4 && tut.t > 1.6) {
+    progress.tutorialDone = true; saveState();
+    tut = null;
+  }
+}
 function update(dt) {
   time += dt;
   updateMusic(dt);
@@ -628,54 +785,88 @@ function update(dt) {
   shake = Math.max(0, shake - dt * 3);
   redFlash = Math.max(0, redFlash - dt * 2);
 
-  // particles & popups always animate
+  // particles & popups & bolts always animate
   for (const p of particles) { p.x += p.vx * dt * 60; p.y += p.vy * dt * 60; p.vx *= 0.96; p.vy *= 0.96; p.life -= p.decay * dt; }
   particles = particles.filter(p => p.life > 0);
   for (const p of popups) { p.y -= 30 * dt; p.life -= dt * 0.9; }
   popups = popups.filter(p => p.life > 0);
+  for (const b of bolts) b.life -= dt;
+  bolts = bolts.filter(b => b.life > 0);
 
   if (state !== S.PLAY) { endT += dt; return; }
 
-  const L = LEVELS[levelIdx];
-  levelT += dt;
+  if (endless) LV = endlessCfg(levelT); // difficulty tracks survival time
+  const L = LV;
 
-  // keyboard control (desktop testing)
+  // effect timers run on real time; hit-stop and slow-mo scale the game clock
+  fx.slow = Math.max(0, fx.slow - dt);
+  fx.wide = Math.max(0, fx.wide - dt);
+  fx.auto = Math.max(0, fx.auto - dt);
+  let sdt = dt;
+  if (hitStop > 0) { hitStop = Math.max(0, hitStop - dt); sdt *= 0.12; }
+  if (fx.slow > 0) sdt *= 0.55;
+  if (!tut) levelT += sdt;
+
+  // keyboard control (desktop testing) — controls always run at full speed
   const kSpd = 4.5 * dt;
   if (keys['a'] || keys['A']) nodes[0].angle -= kSpd;
   if (keys['d'] || keys['D']) nodes[0].angle += kSpd;
   if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
   if (keys['ArrowRight']) nodes[1].angle += kSpd;
 
-  if (levelT < L.duration) trySpawn(dt); // stop spawning once the run distance is covered
+  if (tut) updateTutorial(sdt);
+  else if (levelT < L.duration) trySpawn(sdt); // stop spawning once the run distance is covered
+  if (burstQ) {
+    burstQ.t -= sdt;
+    if (burstQ.t <= 0) { spawnEnemy(); burstQ.left--; burstQ.t = 0.35; if (!burstQ.left) burstQ = null; }
+  }
+  pickupT -= sdt;
+  if (!tut && pickupT <= 0) { pickupT = rand(20, 32); spawnPickup(); }
 
   const g = geo();
-  const TOL = 0.314; // angular tolerance ~18°
+  const waveMul = L.waves ? 1 + 0.3 * Math.sin(levelT * 0.55) : 1;
+  const TOL = 0.314 * (fx.wide > 0 ? 1.7 : 1); // angular tolerance ~18°, widened by the power-up
   const covers = (n, a) => Math.abs(angDiff(n.angle, a)) < TOL;
   const ringXY = a => ({ x: g.cx + Math.cos(a) * g.nodeR, y: g.cy + Math.sin(a) * g.nodeR });
+  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
+  const nodeXY = n => ({ x: g.cx + Math.cos(n.angle) * railR, y: g.cy + Math.sin(n.angle) * railR });
+  const nearest = a => Math.abs(angDiff(nodes[0].angle, a)) < Math.abs(angDiff(nodes[1].angle, a)) ? nodes[0] : nodes[1];
 
   for (const en of enemies) {
-    en.z -= L.speed * (en.speedMul || 1) * dt;
-    en.spin += dt * 4;
-    if (en.drift) en.angle += en.drift * dt;
+    en.z -= L.speed * waveMul * (en.speedMul || 1) * sdt;
+    en.spin += sdt * 4;
+    if (en.drift) en.angle += en.drift * sdt;
 
     if (!en.dead && !en.resolved && en.z <= g.hitZ) {
-      let hit;
-      if (en.type === 'heavy') {
+      let hit = false;
+      const boltPairs = []; // [node, targetAngle] — where the lightning jumps from/to
+      if (fx.auto > 0) {
+        hit = true; // auto-zap: the firewall clears anything crossing the ring
+        if (en.partner) boltPairs.push([nodes[0], en.angle], [nodes[1], en.partner.angle]);
+        else boltPairs.push([nearest(en.angle), en.angle]);
+      } else if (en.type === 'heavy') {
         // heavy: both nodes must pin it at once
         hit = covers(nodes[0], en.angle) && covers(nodes[1], en.angle);
+        if (hit) boltPairs.push([nodes[0], en.angle], [nodes[1], en.angle]);
       } else if (en.type === 'line') {
         // barrier: one node on each end, either assignment
         const p = en.partner;
-        hit = (covers(nodes[0], en.angle) && covers(nodes[1], p.angle)) ||
-              (covers(nodes[1], en.angle) && covers(nodes[0], p.angle));
+        if (covers(nodes[0], en.angle) && covers(nodes[1], p.angle)) { hit = true; boltPairs.push([nodes[0], en.angle], [nodes[1], p.angle]); }
+        else if (covers(nodes[1], en.angle) && covers(nodes[0], p.angle)) { hit = true; boltPairs.push([nodes[1], en.angle], [nodes[0], p.angle]); }
+      } else if (en.lock !== undefined) {
+        // color-locked: only the matching node can break it
+        hit = covers(nodes[en.lock], en.angle);
+        if (hit) boltPairs.push([nodes[en.lock], en.angle]);
       } else {
-        hit = covers(nodes[0], en.angle) || covers(nodes[1], en.angle);
+        const shooter = covers(nodes[0], en.angle) ? nodes[0] : covers(nodes[1], en.angle) ? nodes[1] : null;
+        hit = !!shooter;
+        if (shooter) boltPairs.push([shooter, en.angle]);
       }
       const { x: ex, y: ey } = ringXY(en.angle);
       if (hit) {
         en.dead = true;
         combo++;
-        const base = en.type === 'heavy' ? 250 : en.type === 'line' ? 300 : 100;
+        const base = en.type === 'heavy' ? 250 : en.type === 'line' ? 300 : en.lock !== undefined ? 150 : 100;
         const pts = base * Math.min(combo, 5);
         score += pts; zaps++;
         burst(ex, ey, '#bfeaff', 26, 4);
@@ -686,27 +877,101 @@ function update(dt) {
           burst(p2.x, p2.y, '#bfeaff', 26, 4);
           burst(p2.x, p2.y, '#ffffff', 14, 5);
         }
+        for (const [n, a] of boltPairs) {
+          const s0 = nodeXY(n), t0 = ringXY(a);
+          spawnBolt(s0.x, s0.y, t0.x, t0.y);
+        }
+        hitStop = Math.min(hitStop + (en.type === 'normal' ? 0.05 : 0.09), 0.12);
         popup(ex, ey, '+' + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), '#bfeaff');
         shake = Math.min(shake + (en.type === 'normal' ? 0.35 : 0.5), 0.8);
-        sfx.zap();
-        if (navigator.vibrate) navigator.vibrate(en.type === 'normal' ? 18 : 30);
+        sfx.zap(combo);
+        buzz(en.type === 'normal' ? 18 : 30);
       } else {
         en.resolved = true; // slips past the ring and flies by the player
         if (en.partner) en.partner.resolved = true; // the pair fails as one
-        misses++; combo = 0;
-        integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
-        burst(ex, ey, '#ff4a5e', 20, 3);
-        popup(ex, ey, 'DATA STOLEN', '#ff4a5e');
-        redFlash = 1; shake = Math.min(shake + 0.6, 1);
-        sfx.miss();
-        if (navigator.vibrate) navigator.vibrate([40, 40, 60]);
+        if (en.tut) {
+          if (tut) { tut.respawn = en.tut; tut.t = 0; } // practice trap: no penalty, try again
+        } else {
+          misses++; combo = 0;
+          integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
+          burst(ex, ey, '#ff4a5e', 20, 3);
+          popup(ex, ey, 'DATA STOLEN', '#ff4a5e');
+          redFlash = 1; shake = Math.min(shake + 0.6, 1);
+          sfx.miss();
+          buzz([40, 40, 60]);
+        }
       }
     }
   }
   enemies = enemies.filter(e => !e.dead && e.z > 0.03);
 
+  // power-up orbs ride the stream; catching one at the ring arms its effect
+  for (const p of pickups) {
+    p.z -= L.speed * 0.9 * sdt;
+    p.spin += dt * 2;
+    if (!p.done && p.z <= g.hitZ) {
+      p.done = true;
+      if (covers(nodes[0], p.angle) || covers(nodes[1], p.angle)) {
+        p.dead = true;
+        fx[p.kind] = PICKUPS[p.kind].dur;
+        const { x, y } = ringXY(p.angle);
+        burst(x, y, '#ffd24a', 24, 4);
+        popup(x, y, PICKUPS[p.kind].label, '#ffd24a');
+        sfx.pick();
+        buzz(15);
+      }
+    }
+  }
+  pickups = pickups.filter(p => !p.dead && p.z > 0.03);
+
+  // the firewall core: park at the ring, drift, drain under node coverage
+  if (boss) {
+    boss.spin += sdt * 3;
+    boss.flash = Math.max(0, boss.flash - dt);
+    if (boss.z > g.hitZ * 1.7) boss.z -= L.speed * 0.5 * sdt;
+    boss.angle += boss.drift * sdt;
+    boss.retarget -= sdt;
+    if (boss.retarget <= 0) {
+      boss.retarget = rand(2.5, 4.5);
+      boss.drift = (Math.random() < 0.5 ? -1 : 1) * rand(0.15, 0.4);
+    }
+    for (let i = 0; i < 2; i++) {
+      boss.cd[i] = Math.max(0, boss.cd[i] - sdt);
+      if (boss.cd[i] <= 0 && boss.z <= g.hitZ * 2 && Math.abs(angDiff(nodes[i].angle, boss.angle)) < TOL * 1.2) {
+        boss.cd[i] = 0.55;
+        boss.hp--;
+        boss.flash = 0.2;
+        const t0 = ringXY(boss.angle), s0 = nodeXY(nodes[i]);
+        spawnBolt(s0.x, s0.y, t0.x, t0.y);
+        burst(t0.x, t0.y, '#d98cff', 18, 4);
+        score += 150;
+        hitStop = Math.min(hitStop + 0.04, 0.12);
+        sfx.zap(4);
+        buzz(20);
+        if (boss.hp <= 0) {
+          burst(t0.x, t0.y, '#ffffff', 40, 6);
+          burst(t0.x, t0.y, '#d98cff', 40, 5);
+          popup(t0.x, t0.y, 'FIREWALL DOWN  +2000', '#ffd24a');
+          score += 2000;
+          boss = null;
+          shake = 1;
+          buzz([60, 40, 80]);
+          endLevel(true);
+          return;
+        }
+      }
+    }
+    if (boss) {
+      boss.minionT -= sdt;
+      if (boss.minionT <= 0) { boss.minionT = rand(3.5, 5.5); spawnEnemy(); }
+    }
+  }
+
   if (integrity <= 0) { endLevel(false); return; }
-  if (levelT >= L.duration && enemies.length === 0) { endLevel(true); }
+  if (!tut && !endless && levelT >= L.duration) {
+    if (L.boss) { if (!boss) spawnBoss(); }
+    else if (enemies.length === 0) endLevel(true);
+  }
 }
 
 // ---------- drawing ----------
@@ -810,6 +1075,14 @@ function drawEnemy(en, g) {
     ? { glow: '200,70,255', tendril: '#4a1060', tendrilHi: '#d98cff',
         shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'],
         lights: ['#eab8ff', '#f3d4ff', '#d98cff'] }
+    : en.lock === 0
+    ? { glow: '80,170,255', tendril: '#0f2f66', tendrilHi: '#7db2ff',
+        shades: ['#2f7fe0', '#1c4fae', '#4d9bff', '#12398a', '#3f8af0'],
+        lights: ['#a8ccff', '#d0e4ff', '#7db2ff'] }
+    : en.lock === 1
+    ? { glow: '225,240,255', tendril: '#5a6a7e', tendrilHi: '#eaf4ff',
+        shades: ['#c8d6e6', '#9fb2c8', '#e8f2fc', '#8194ab', '#d5e2f0'],
+        lights: ['#ffffff', '#eef6ff', '#dbe8f6'] }
     : en.crawler
     ? { glow: '255,150,40', tendril: '#8a4a12', tendrilHi: '#ffb361',
         shades: ['#ff8c2a', '#e05e14', '#ffb340', '#c24a08', '#ff7a50'],
@@ -892,8 +1165,8 @@ function drawEnemy(en, g) {
   // molten amber core burning through the facets
   const cg = ctx.createRadialGradient(-size * 0.12, -size * 0.14, 0, 0, 0, size * 0.48);
   cg.addColorStop(0, '#ffffff');
-  cg.addColorStop(0.3, en.type === 'heavy' ? '#e08cff' : '#ffd24a');
-  cg.addColorStop(0.7, en.type === 'heavy' ? '#b03ae8' : en.crawler ? '#ff8c2a' : '#ff5a3c');
+  cg.addColorStop(0.3, en.type === 'heavy' ? '#e08cff' : en.lock === 0 ? '#7db2ff' : en.lock === 1 ? '#ffffff' : '#ffd24a');
+  cg.addColorStop(0.7, en.type === 'heavy' ? '#b03ae8' : en.lock === 0 ? '#2f7fe0' : en.lock === 1 ? '#c8d6e6' : en.crawler ? '#ff8c2a' : '#ff5a3c');
   cg.addColorStop(1, 'rgba(255,90,60,0)');
   ctx.fillStyle = cg;
   ctx.beginPath(); ctx.arc(0, 0, size * 0.48 * pulse, 0, TAU); ctx.fill();
@@ -913,6 +1186,142 @@ function drawEnemy(en, g) {
     ctx.fillStyle = '#ffffff';
     ctx.beginPath(); ctx.arc(Math.cos(oa + Math.PI) * or2, Math.sin(oa + Math.PI) * or2, ds, 0, TAU); ctx.fill();
     ctx.globalAlpha = fade;
+  }
+  // color lock sigil — a single orbiting dot in the required node's color
+  if (en.lock !== undefined && near > 0.15) {
+    const sa = clamp((near - 0.15) / 0.3, 0, 1) * fade;
+    const col = en.lock === 0 ? 'rgb(111,227,255)' : '#ffffff';
+    ctx.globalAlpha = sa * 0.55;
+    ctx.strokeStyle = col; ctx.lineWidth = Math.max(0.8, size * 0.055);
+    ctx.beginPath(); ctx.arc(0, 0, size * 1.05, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = sa;
+    const oa2 = en.spin * 1.4, ds2 = Math.max(1.5, size * 0.13);
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(Math.cos(oa2) * size * 1.05, Math.sin(oa2) * size * 1.05, ds2, 0, TAU); ctx.fill();
+    ctx.globalAlpha = fade;
+  }
+  ctx.restore();
+}
+
+// lightning arcs from node carriages to zapped traps — jagged, fast fade
+function drawBolts() {
+  for (const b of bolts) {
+    const a = clamp(b.life / b.max, 0, 1);
+    const dx = b.x2 - b.x1, dy = b.y2 - b.y1;
+    const dl = Math.hypot(dx, dy) || 1;
+    const nx = -dy / dl, ny = dx / dl;
+    ctx.lineCap = 'round';
+    for (let pass = 0; pass < 2; pass++) {
+      ctx.strokeStyle = pass === 0 ? 'rgba(140,215,255,' + (a * 0.85).toFixed(2) + ')' : 'rgba(255,255,255,' + a.toFixed(2) + ')';
+      ctx.lineWidth = pass === 0 ? 4 : 1.5;
+      ctx.beginPath();
+      ctx.moveTo(b.x1, b.y1);
+      const segs = 7;
+      for (let i = 1; i < segs; i++) {
+        const t = i / segs;
+        const off = (Math.random() - 0.5) * 16 * a;
+        ctx.lineTo(b.x1 + dx * t + nx * off, b.y1 + dy * t + ny * off);
+      }
+      ctx.lineTo(b.x2, b.y2);
+      ctx.stroke();
+    }
+  }
+}
+
+// golden power-up orb with a kind-specific icon
+function drawPickup(p, g) {
+  const rg = ring(Math.max(p.z, 0.02), g);
+  const x = rg.x + Math.cos(p.angle) * rg.r, y = rg.y + Math.sin(p.angle) * rg.r;
+  const size = lerp(3, Math.min(W, H) * 0.042, 1 - p.z);
+  let fade = clamp((1.08 - p.z) / 0.18, 0, 1);
+  if (p.done) fade *= clamp(p.z / g.hitZ, 0, 1);
+  if (fade <= 0.005) return;
+  ctx.save();
+  ctx.globalAlpha = fade;
+  ctx.translate(x, y);
+  const pulse = 1 + Math.sin(time * 5 + p.spin) * 0.1;
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 2.6 * pulse);
+  gl.addColorStop(0, 'rgba(255,210,74,0.55)');
+  gl.addColorStop(1, 'rgba(255,210,74,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, size * 2.6 * pulse, 0, TAU); ctx.fill();
+  ctx.rotate(p.spin * 0.6);
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a2 = i / 6 * TAU;
+    i ? ctx.lineTo(Math.cos(a2) * size, Math.sin(a2) * size) : ctx.moveTo(Math.cos(a2) * size, Math.sin(a2) * size);
+  }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(60,40,5,0.85)'; ctx.fill();
+  ctx.strokeStyle = '#ffd24a'; ctx.lineWidth = Math.max(1, size * 0.14); ctx.stroke();
+  ctx.rotate(-p.spin * 0.6);
+  ctx.strokeStyle = '#ffe9b0'; ctx.fillStyle = '#ffe9b0';
+  ctx.lineWidth = Math.max(1, size * 0.12); ctx.lineCap = 'round';
+  const s2 = size * 0.52;
+  if (p.kind === 'slow') { // hourglass
+    ctx.beginPath();
+    ctx.moveTo(-s2 * 0.7, -s2); ctx.lineTo(s2 * 0.7, -s2); ctx.lineTo(-s2 * 0.7, s2); ctx.lineTo(s2 * 0.7, s2);
+    ctx.closePath(); ctx.stroke();
+  } else if (p.kind === 'wide') { // widening arcs
+    ctx.beginPath(); ctx.arc(0, 0, s2 * 0.55, -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, s2 * 1.05, -0.7, 0.7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, s2 * 0.55, Math.PI - 0.9, Math.PI + 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, s2 * 1.05, Math.PI - 0.7, Math.PI + 0.7); ctx.stroke();
+  } else { // lightning bolt
+    ctx.beginPath();
+    ctx.moveTo(s2 * 0.3, -s2); ctx.lineTo(-s2 * 0.45, s2 * 0.15); ctx.lineTo(0, s2 * 0.15);
+    ctx.lineTo(-s2 * 0.3, s2); ctx.lineTo(s2 * 0.45, -0.15 * s2); ctx.lineTo(0, -0.15 * s2);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// the firewall core — armored violet mass parked at the ring with an hp fan
+function drawBoss(g) {
+  const rg = ring(Math.max(boss.z, 0.02), g);
+  const x = rg.x + Math.cos(boss.angle) * rg.r, y = rg.y + Math.sin(boss.angle) * rg.r;
+  const size = Math.min(W, H) * 0.085 * (1 + Math.sin(boss.spin * 1.6) * 0.05);
+  const fade = clamp((1.08 - boss.z) / 0.18, 0, 1);
+  if (fade <= 0.005) return;
+  ctx.save();
+  ctx.globalAlpha = fade;
+  ctx.translate(x, y);
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 3);
+  gl.addColorStop(0, 'rgba(210,80,255,0.5)');
+  gl.addColorStop(0.5, 'rgba(255,60,90,0.18)');
+  gl.addColorStop(1, 'rgba(255,60,90,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, size * 3, 0, TAU); ctx.fill();
+  // rotating shard collar
+  ctx.rotate(boss.spin * 0.5);
+  for (let i = 0; i < 12; i++) {
+    const a2 = i / 12 * TAU;
+    const r1 = size * 1.15, r2 = size * (1.5 + (i % 3) * 0.16);
+    ctx.fillStyle = i % 2 ? '#8a2ad4' : '#d465ff';
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a2 - 0.1) * r1, Math.sin(a2 - 0.1) * r1);
+    ctx.lineTo(Math.cos(a2) * r2, Math.sin(a2) * r2);
+    ctx.lineTo(Math.cos(a2 + 0.1) * r1, Math.sin(a2 + 0.1) * r1);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.rotate(-boss.spin * 0.5);
+  // armored core, flashing white when drained
+  const flash = boss.flash > 0 ? boss.flash / 0.2 : 0;
+  const cg2 = ctx.createRadialGradient(-size * 0.15, -size * 0.18, 0, 0, 0, size * 1.1);
+  cg2.addColorStop(0, flash > 0.3 ? '#ffffff' : '#f3d4ff');
+  cg2.addColorStop(0.45, '#b03ae8');
+  cg2.addColorStop(1, '#3a0a5e');
+  ctx.fillStyle = cg2;
+  ctx.beginPath(); ctx.arc(0, 0, size * 1.05, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,' + (0.25 + flash * 0.75).toFixed(2) + ')';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, size * 1.05, 0, TAU); ctx.stroke();
+  // hp pips fanned above the core
+  for (let i = 0; i < boss.maxHp; i++) {
+    const a0 = -Math.PI / 2 + (i - boss.maxHp / 2 + 0.5) * 0.26;
+    ctx.strokeStyle = i < boss.hp ? '#ff5a8c' : 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = Math.max(2, size * 0.1);
+    ctx.beginPath(); ctx.arc(0, 0, size * 1.45, a0 - 0.09, a0 + 0.09); ctx.stroke();
   }
   ctx.restore();
 }
@@ -1071,10 +1480,28 @@ function drawDials() {
       }
       ctx.fillStyle = en.type === 'heavy'
         ? `rgba(200,80,255,${al})`
+        : en.lock === 0
+        ? `rgba(80,170,255,${al})`
+        : en.lock === 1
+        ? `rgba(240,248,255,${al})`
         : en.crawler
         ? `rgba(255,140,40,${al})`
         : `rgba(220,50,50,${al})`;
       ctx.fillRect(bx - bs / 2, by - bs / 2, bs, bs);
+    }
+    // golden pickup blips
+    for (const p of pickups) {
+      if (p.done) continue;
+      const { x: gx, y: gy } = blipXY(p);
+      ctx.fillStyle = 'rgba(255,210,74,0.9)';
+      ctx.beginPath(); ctx.arc(gx, gy, 2.5 + (1 - p.z) * 2, 0, TAU); ctx.fill();
+    }
+    // the firewall core: oversized blinking blip
+    if (boss) {
+      const { x: bx2, y: by2 } = blipXY(boss);
+      ctx.fillStyle = Math.sin(time * 8) > 0 ? 'rgba(210,80,255,0.95)' : 'rgba(210,80,255,0.45)';
+      const bs2 = 7;
+      ctx.fillRect(bx2 - bs2 / 2, by2 - bs2 / 2, bs2, bs2);
     }
   }
 }
@@ -1155,18 +1582,18 @@ function techPanel(x, y, w, h, title) {
 }
 
 function drawHUD(g) {
-  const L = LEVELS[levelIdx];
+  const L = LV || LEVELS[levelIdx];
   const pad = 14;
 
   // level intro title — fades out as the run begins (lingers longer when there's a threat hint)
   const introDur = L.hint ? 3.6 : 2.4;
-  if (levelT < introDur) {
+  if (levelT < introDur && !tut) {
     const a = levelT < introDur - 0.6 ? 1 : (introDur - levelT) / 0.6;
     ctx.textAlign = 'center';
     ctx.globalAlpha = a;
     try { ctx.letterSpacing = '5px'; } catch (e) {}
     ctx.fillStyle = 'rgba(200,235,255,0.8)'; ctx.font = '600 12px system-ui';
-    ctx.fillText('LEVEL ' + (levelIdx + 1), W / 2, H * 0.16);
+    ctx.fillText(endless ? 'SURVIVE' : 'LEVEL ' + (levelIdx + 1), W / 2, H * 0.16);
     ctx.fillStyle = '#eafaff'; ctx.font = '800 ' + Math.min(W * 0.045, 26) + 'px system-ui';
     ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 18;
     ctx.fillText(L.name, W / 2, H * 0.16 + 30);
@@ -1192,9 +1619,10 @@ function drawHUD(g) {
   ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
   ctx.strokeStyle = '#050a12'; ctx.lineWidth = bw2 + 2;
   ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
-  const prog = clamp(levelT / L.duration, 0, 1);
+  // endless: the left bar shows the difficulty ramp instead of level progress
+  const prog = endless ? clamp(levelT / 150, 0, 1) : clamp(levelT / L.duration, 0, 1);
   if (prog > 0.005) {
-    ctx.strokeStyle = '#7ee262';
+    ctx.strokeStyle = endless ? '#ff9a3c' : '#7ee262';
     ctx.lineWidth = bw2 - 4;
     ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL0 + (aL1 - aL0) * prog); ctx.stroke();
   }
@@ -1237,6 +1665,73 @@ function drawHUD(g) {
   ctx.fillStyle = 'rgba(220,245,255,0.92)';
   ctx.fillRect(pauseBtnRect.x + 12, pauseBtnRect.y + 11, 5, 16);
   ctx.fillRect(pauseBtnRect.x + 21, pauseBtnRect.y + 11, 5, 16);
+
+  // active power-up chips (top center)
+  const active = Object.keys(fx).filter(k => fx[k] > 0);
+  active.forEach((k, i) => {
+    const cw = 92, chh = 20;
+    const x0 = W / 2 - (active.length * (cw + 8) - 8) / 2 + i * (cw + 8);
+    const y0 = 14 + SAFE.t;
+    techRect(x0, y0, cw, chh, 6);
+    ctx.fillStyle = 'rgba(60,40,5,0.65)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,210,74,0.8)'; ctx.lineWidth = 1;
+    techRect(x0, y0, cw, chh, 6); ctx.stroke();
+    ctx.fillStyle = '#ffe9b0'; ctx.font = '700 10px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(PICKUPS[k].label, x0 + 9, y0 + 14);
+    ctx.fillStyle = 'rgba(255,210,74,0.9)';
+    ctx.fillRect(x0, y0 + chh + 3, cw * clamp(fx[k] / PICKUPS[k].dur, 0, 1), 2);
+  });
+
+  // tutorial prompts + guides
+  if (tut) {
+    const ten = enemies.find(e => e.tut && !e.dead && !e.resolved);
+    let msg = null;
+    if (tut.step <= 1) msg = 'Slide your LEFT thumb — align the BLUE node with the trap';
+    else if (tut.step === 2) msg = 'NICE!  Missed traps corrupt the payload';
+    else if (tut.step === 3) msg = 'Now your RIGHT thumb — align the WHITE node';
+    else if (tut.step === 4) msg = "You're ready — defend the payload!";
+    if (msg) {
+      const a = 0.75 + Math.sin(time * 4) * 0.25;
+      ctx.textAlign = 'center';
+      ctx.font = '700 ' + Math.min(W * 0.026, 17) + 'px system-ui';
+      const tw = ctx.measureText(msg).width;
+      ctx.fillStyle = 'rgba(9,20,40,0.72)';
+      roundRect(W / 2 - tw / 2 - 16, H * 0.70 - 20, tw + 32, 30, 8); ctx.fill();
+      ctx.fillStyle = 'rgba(190,240,255,' + a.toFixed(2) + ')';
+      ctx.fillText(msg, W / 2, H * 0.70);
+      ctx.textAlign = 'left';
+    }
+    if (ten) {
+      drawGuideArc(nodes[ten.tut === 'L' ? 0 : 1], ten.angle);
+      const d = dialCenter(ten.tut);
+      const pr = d.r + 6 + Math.sin(time * 5) * 3;
+      ctx.strokeStyle = ten.tut === 'L' ? 'rgba(111,227,255,0.8)' : 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(d.x, d.y, pr, 0, TAU); ctx.stroke();
+    }
+  }
+}
+
+// marching dashed arc from a node toward the tutorial trap, with an arrowhead
+function drawGuideArc(n, targetA) {
+  const g2 = geo();
+  const rr = g2.nodeR - Math.min(W, H) * 0.055 * 2.0;
+  const d = angDiff(targetA, n.angle);
+  if (Math.abs(d) < 0.3) return; // close enough — no guide needed
+  const dir = Math.sign(d);
+  const a0 = n.angle + dir * 0.12, a1 = n.angle + d * 0.82;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(120,225,255,0.85)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([9, 9]);
+  ctx.lineDashOffset = -time * 60 * dir;
+  ctx.beginPath(); ctx.arc(g2.cx, g2.cy, rr, a0, a1, dir < 0); ctx.stroke();
+  ctx.setLineDash([]);
+  const hx = g2.cx + Math.cos(a1) * rr, hy = g2.cy + Math.sin(a1) * rr;
+  ctx.translate(hx, hy); ctx.rotate(a1 + dir * Math.PI / 2);
+  ctx.fillStyle = 'rgba(160,240,255,0.95)';
+  ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(-5, -6); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill();
+  ctx.restore();
 }
 
 // one audio channel row: label · angular toggle · tick-marked slider (shared by pause + menu)
@@ -1256,6 +1751,7 @@ function settingRow(label, key, volKey, y, px, pw) {
   ctx.fillStyle = on ? '#dff6ff' : 'rgba(160,190,230,0.45)';
   ctx.fillRect(on ? tx + tw - ks - 4.5 : tx + 4.5, y - ks / 2, ks, ks);
   pauseTogglesList.push({ x: tx, y: y - th / 2, w: tw, h: th, key });
+  if (!volKey) return; // toggle-only row (e.g. haptics)
   // volume rail with depth ticks and a diamond cursor
   const sx = tx + tw + 26, sw2 = px + pw - 36 - sx;
   ctx.lineCap = 'butt';
@@ -1301,11 +1797,12 @@ function drawPause() {
   const pw = Math.min(W * 0.74, 540), ph = Math.min(H * 0.84, 320);
   const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
   techPanel(px, py, pw, ph, 'SYSTEM PAUSED');
-  settingRow('SFX',   'sound', 'soundVol', py + 84,  px, pw);
-  settingRow('MUSIC', 'music', 'musicVol', py + 132, px, pw);
+  settingRow('SFX',     'sound',   'soundVol', py + 78,  px, pw);
+  settingRow('MUSIC',   'music',   'musicVol', py + 122, px, pw);
+  settingRow('HAPTICS', 'haptics', null,       py + 166, px, pw);
   // live console readout, pure garnish
   ctx.fillStyle = 'rgba(120,210,255,0.35)'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-  ctx.fillText('m_fSfxVol = ' + settings.soundVol.toFixed(2) + 'f;   m_fMusicVol = ' + settings.musicVol.toFixed(2) + 'f;', px + 24, py + 170);
+  ctx.fillText('m_fSfxVol = ' + settings.soundVol.toFixed(2) + 'f;   m_fMusicVol = ' + settings.musicVol.toFixed(2) + 'f;', px + 24, py + 196);
 
   const bh = 46, gap = 12, bw = (pw - 48 - gap * 2) / 3;
   let bx = px + 24; const by = py + ph - bh - 24;
@@ -1461,7 +1958,7 @@ function levelKey(x, y, w, h, num, name, stars, locked, primary) {
     roundRect(x + w - 41, y + h / 2 - 13, 26, 26, 6);
     ctx.strokeStyle = 'rgba(220,240,255,0.55)'; ctx.lineWidth = 1.5; ctx.stroke();
     padlock(x + w - 28, y + h / 2, 7);
-  } else {
+  } else if (stars >= 0) {
     for (let i = 0; i < 3; i++) star5(x + w - 70 + i * 23, y + h / 2, 8.5, i < stars);
   }
 }
@@ -1471,13 +1968,16 @@ function menuGeom() {
   const ccx = W / 2, ccy = H / 2;
   const R = Math.min(H * 0.52, W * 0.30);
   const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
-  const total = LEVELS.length * (bh + gap) - gap;
-  const listY = ccy - total / 2 + 8;
-  return { ccx, ccy, R, bw, bh, gap, total, listY };
+  const items = LEVELS.length + 1; // + the endless key
+  const listY = ccy - R + 52;
+  const contentH = items * (bh + gap) - gap;
+  const viewH = H - listY - 6;
+  const maxScroll = Math.max(0, contentH - viewH);
+  return { ccx, ccy, R, bw, bh, gap, items, listY, contentH, viewH, maxScroll };
 }
 // static menu furniture — repainted only on resize, blitted every frame
 function paintMenuStatic() {
-  const { ccx, ccy, R, gap, total, listY } = menuGeom();
+  const { ccx, ccy, R } = menuGeom();
   // HUD garnish
   plusCluster(W - 118, 26, 'rgba(120,220,255,0.45)');
   plusCluster(W - 140, H - 40, 'rgba(120,220,255,0.25)');
@@ -1517,9 +2017,6 @@ function paintMenuStatic() {
   try { ctx.letterSpacing = '1px'; } catch (e) {}
   ctx.fillText('Select a level', ccx, ccy - R + 34);
   try { ctx.letterSpacing = '0px'; } catch (e) {}
-  // control hint under the list
-  ctx.fillStyle = 'rgba(180,215,255,0.5)'; ctx.font = '500 11px system-ui';
-  ctx.fillText('Left thumb = blue node · Right thumb = white node', ccx, listY + total + gap + 14);
   ctx.textAlign = 'left';
 }
 let menuCache = null;
@@ -1537,7 +2034,7 @@ function drawMenu(g) {
   menuButtons = [];
   if (!menuCache) buildMenuCache();
   if (menuCache) ctx.drawImage(menuCache, 0, 0, W, H);
-  const { ccx, ccy, R, bw, bh, gap, listY } = menuGeom();
+  const { ccx, ccy, R, bw, bh, gap, listY, contentH, viewH, maxScroll } = menuGeom();
 
   ctx.font = '10px monospace'; ctx.textAlign = 'left';
   // bottom-left: diagnostic carousel — count up fast, hold ~5s, then the next block
@@ -1582,22 +2079,42 @@ function drawMenu(g) {
     ctx.fillRect(knobX[i] - 2.5, gy - 3.5, 5, 7);
   }
 
-  // scroll thumb — bright arc segment on the rail
+  // scroll thumb — bright arc segment tracking the list position
+  menuScroll = clamp(menuScroll, 0, maxScroll);
+  const trackA0 = -0.42 * Math.PI, trackA1 = 0.42 * Math.PI;
+  const span = (trackA1 - trackA0) * clamp(viewH / contentH, 0.15, 1);
+  const soff = maxScroll > 0 ? (menuScroll / maxScroll) * ((trackA1 - trackA0) - span) : 0;
   ctx.lineCap = 'round';
   ctx.strokeStyle = '#4db6ff'; ctx.lineWidth = 7;
   ctx.shadowColor = 'rgba(90,200,255,0.8)'; ctx.shadowBlur = lowFX ? 0 : 8;
-  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, -0.16 * Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, trackA0 + soff, trackA0 + soff + span); ctx.stroke();
   ctx.shadowBlur = 0;
 
-  // level keys, centered in the disc
-  let by = listY;
-  for (let i = 0; i < LEVELS.length; i++) {
+  // scrollable level list inside the disc — drag to scroll, tap to launch
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(ccx - bw / 2 - 30, listY - 4, bw + 60, viewH + 8);
+  ctx.clip();
+  const endlessOpen = progress.stars[LEVELS.length - 1] > 0; // clear the campaign to unlock
+  for (let i = 0; i <= LEVELS.length; i++) {
+    const by = listY + i * (bh + gap) - menuScroll;
+    if (by + bh < listY - 6 || by > listY + viewH + 6) continue;
     const bx = ccx - bw / 2;
-    const locked = i + 1 > progress.unlocked;
-    levelKey(bx, by, bw, bh, i + 1, LEVELS[i].name, progress.stars[i], locked, i + 1 === progress.unlocked);
-    menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
-    by += bh + gap;
+    if (i < LEVELS.length) {
+      const locked = i + 1 > progress.unlocked;
+      levelKey(bx, by, bw, bh, i + 1, LEVELS[i].name, progress.stars[i], locked, i + 1 === progress.unlocked);
+      menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
+    } else {
+      levelKey(bx, by, bw, bh, '∞', 'ENDLESS STREAM', -1, !endlessOpen, endlessOpen);
+      if (endlessOpen && progress.best > 0) {
+        ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(255,210,74,0.85)'; ctx.font = '700 10px system-ui';
+        ctx.fillText('BEST ' + progress.best.toLocaleString(), bx + bw - 14, by + bh - 8);
+        ctx.textAlign = 'left';
+      }
+      menuButtons.push({ x: bx, y: by, w: bw, h: bh, endless: true, locked: !endlessOpen });
+    }
   }
+  ctx.restore();
   ctx.textAlign = 'left';
 
   if (menuSettings) drawMenuSettings();
@@ -1607,12 +2124,13 @@ function drawMenu(g) {
 function drawMenuSettings() {
   pauseSlidersList = []; pauseTogglesList = []; menuSetButtons = [];
   ctx.fillStyle = 'rgba(3,6,14,0.62)'; ctx.fillRect(0, 0, W, H);
-  const pw = Math.min(W * 0.72, 520), ph = Math.min(H * 0.8, 250);
+  const pw = Math.min(W * 0.72, 520), ph = Math.min(H * 0.84, 296);
   const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
   menuSetPanel = { x: px, y: py, w: pw, h: ph };
   techPanel(px, py, pw, ph, 'AUDIO CONFIG');
-  settingRow('SFX',   'sound', 'soundVol', py + 78,  px, pw);
-  settingRow('MUSIC', 'music', 'musicVol', py + 124, px, pw);
+  settingRow('SFX',     'sound',   'soundVol', py + 76,  px, pw);
+  settingRow('MUSIC',   'music',   'musicVol', py + 120, px, pw);
+  settingRow('HAPTICS', 'haptics', null,       py + 164, px, pw);
   const bw = 160, bh = 42;
   button(W / 2 - bw / 2, py + ph - bh - 20, bw, bh, 'CLOSE', true);
   menuSetButtons.push({ x: W / 2 - bw / 2, y: py + ph - bh - 20, w: bw, h: bh, action: 'close' });
@@ -1632,14 +2150,15 @@ function drawEnd(g) {
   const bh = 50;
   const panelBottom = (isLandscape() ? H * 0.66 + bh : H * 0.62 + list.length * (bh + 14) - 14) + 24;
   const pw = Math.min(W * 0.88, 700), pTop = H * 0.13;
-  techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + LEVELS[levelIdx].name);
+  techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + (endless ? 'ENDLESS STREAM' : LEVELS[levelIdx].name));
 
   ctx.textAlign = 'center';
-  ctx.fillStyle = endWin ? '#69e05c' : '#ff4a5e';
+  const endCol = endless ? '#ffb340' : endWin ? '#69e05c' : '#ff4a5e';
+  ctx.fillStyle = endCol;
   try { ctx.letterSpacing = '4px'; } catch (e) {}
   ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
-  ctx.shadowColor = endWin ? '#69e05c' : '#ff4a5e'; ctx.shadowBlur = 22;
-  ctx.fillText(endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
+  ctx.shadowColor = endCol; ctx.shadowBlur = 22;
+  ctx.fillText(endless ? 'STREAM SEVERED' : endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
   ctx.shadowBlur = 0;
   try { ctx.letterSpacing = '0px'; } catch (e) {}
 
@@ -1653,6 +2172,11 @@ function drawEnd(g) {
   try { ctx.letterSpacing = '0px'; } catch (e) {}
   ctx.fillStyle = 'rgba(140,210,255,0.65)'; ctx.font = '11px monospace';
   ctx.fillText('zapped: ' + zaps + '   //   missed: ' + misses + '   //   integrity: ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
+  if (endless) {
+    ctx.fillStyle = score >= (progress.best || 0) && score > 0 ? '#ffd24a' : 'rgba(255,210,74,0.7)';
+    ctx.font = '700 13px system-ui';
+    ctx.fillText((score >= (progress.best || 0) && score > 0 ? 'NEW BEST  ' : 'BEST  ') + (progress.best || 0).toLocaleString(), W / 2, H * 0.47 + 68);
+  }
   if (isLandscape()) {
     const bw = Math.min(W * 0.24, 210), gap = 16;
     const total = list.length * bw + (list.length - 1) * gap;
@@ -1753,6 +2277,8 @@ function frame(now) {
   const sorted = enemies.slice().sort((a, b) => b.z - a.z);
   for (const en of sorted) if (en.lineLead) drawLineBeam(en, g); // beams sit under the traps
   for (const en of sorted) drawEnemy(en, g);
+  for (const p of pickups) drawPickup(p, g);
+  if (boss && state !== S.MENU) drawBoss(g);
 
   if (state !== S.MENU) drawNodes(g);
 
@@ -1763,6 +2289,7 @@ function frame(now) {
     ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill();
   }
   ctx.globalAlpha = 1;
+  drawBolts();
   ctx.textAlign = 'center';
   for (const p of popups) {
     ctx.globalAlpha = clamp(p.life, 0, 1);

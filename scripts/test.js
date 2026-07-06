@@ -83,7 +83,12 @@ code = code.replace("'use strict';", '') + `
   enemies: () => enemies,
   stats: () => ({ zaps, misses, score, integrity, combo }),
   playTrack, updateMusic, settings, progress, perf: () => ({ lowFX }),
-  music: () => ({ src: musicSrc, gain: musicGain, key: currentTrackKey, ac: AC })
+  music: () => ({ src: musicSrc, gain: musicGain, key: currentTrackKey, ac: AC }),
+  bolts: () => bolts, hitStop: () => hitStop, fx, pickups: () => pickups, spawnPickup,
+  boss: () => boss, endlessCfg, tut: () => tut, isEndless: () => endless, getLV: () => LV,
+  startEndless, menuBtns: () => menuButtons, getEndWin: () => endWin,
+  setLevelT: v => { levelT = v; }, setIntegrity: v => { integrity = v; }, setScore: v => { score = v; },
+  setMenuScroll: v => { menuScroll = v; }
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -93,10 +98,11 @@ function check(name, cond) {
   console.log((cond ? 'PASS' : 'FAIL') + '  ' + name);
   if (!cond) failures++;
 }
-function cross(en) { // place just above the ring and step one tick
+function cross(en) { // place at the ring and step one tick
+  // (exactly hitZ so the hit check fires even when hit-stop slows the clock)
   const hz = G.geo().hitZ;
-  en.z = hz + 0.001;
-  if (en.partner) en.partner.z = hz + 0.001;
+  en.z = hz;
+  if (en.partner) en.partner.z = hz;
   G.update(0.01);
 }
 
@@ -160,7 +166,7 @@ drawOk('menu audio-config overlay', () => { G.setMenuSettings(true); });
 
 // ================= menu settings interaction =================
 G.frame(16);
-check('overlay populated toggle controls', G.toggles().length === 2);
+check('overlay populated toggle controls', G.toggles().length === 3); // SFX, MUSIC, HAPTICS
 const t0 = G.toggles()[0];
 G.menuTap(t0.x + 5, t0.y + 5, 1);
 check('toggle tap flips a setting from the menu overlay', true);
@@ -185,6 +191,120 @@ G.setState(G.S.MENU);
 G.update(6); // past the watchdog's startup grace period
 for (let i = 0; i < 80; i++) G.frame(100000 + i * 40); // sustained 25fps
 check('perf watchdog trips lowFX after sustained slow frames', G.perf().lowFX === true);
+
+// ================= zap juice =================
+G.startLevel(1);
+en = G.spawnEnemy(0.1, 'normal');
+G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1;
+cross(en);
+check('zap spawns a lightning bolt', G.bolts().length > 0);
+check('zap triggers hit-stop', G.hitStop() > 0);
+
+// ================= color-locked traps =================
+G.startLevel(5); // QUANTUM RELAY
+en = G.spawnEnemy(0.1, 'normal'); en.lock = 1; // white node only
+G.nodes[0].angle = 0.1; G.nodes[1].angle = Math.PI; // only the BLUE node covers it
+cross(en);
+check('color-locked trap ignores the wrong node', en.resolved === true && !en.dead);
+en = G.spawnEnemy(0.1, 'normal'); en.lock = 1;
+G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1; // WHITE node covers it
+cross(en);
+check('color-locked trap zapped by its matching node', en.dead === true);
+
+// ================= power-ups =================
+G.startLevel(1);
+G.fx.wide = 10;
+en = G.spawnEnemy(0.45, 'normal'); // outside normal TOL (0.314), inside widened (0.534)
+G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0;
+cross(en);
+check('wide-arc widens the hit window', en.dead === true);
+G.fx.wide = 0;
+G.fx.auto = 5;
+en = G.spawnEnemy(2.5, 'normal');
+G.nodes[0].angle = 0; G.nodes[1].angle = 0.2; // nowhere near it
+cross(en);
+check('auto-zap clears traps without coverage', en.dead === true);
+G.fx.auto = 0;
+for (let i = 0; i < 40; i++) G.update(0.05); // drain hit-stop
+en = G.spawnEnemy(3.0, 'normal'); en.z = 0.9;
+G.update(0.05);
+const dzNormal = 0.9 - en.z;
+en.z = 0.9; G.fx.slow = 6;
+G.update(0.05);
+const dzSlow = 0.9 - en.z;
+G.fx.slow = 0;
+check('slow-mo halves the stream speed', dzSlow < dzNormal * 0.7 && dzSlow > 0);
+G.spawnPickup();
+const pk = G.pickups()[G.pickups().length - 1];
+pk.kind = 'auto'; pk.z = G.geo().hitZ; pk.angle = 1.2;
+G.nodes[0].angle = 1.2;
+G.update(0.01);
+check('catching a pickup arms its effect', G.fx.auto > 4);
+G.fx.auto = 0;
+
+// ================= endless config ramp =================
+const c0 = G.endlessCfg(0), c200 = G.endlessCfg(200);
+check('endless difficulty ramps with time', c200.speed > c0.speed && c200.spawnMin < c0.spawnMin && c200.heavies > 0 && c0.heavies === 0);
+
+// ================= boss (CORE FIREWALL) =================
+G.startLevel(7);
+G.setLevelT(46); // past the level clock
+G.update(0.01);
+check('firewall core spawns after the level clock', !!G.boss());
+const B = G.boss();
+B.z = G.geo().hitZ; B.angle = 1.0; B.drift = 0;
+G.nodes[0].angle = 1.0; G.nodes[1].angle = Math.PI; // one node parked on it
+G.update(0.05);
+check('node coverage drains the core', G.boss().hp < 8);
+let guard = 200;
+while (G.boss() && guard-- > 0) {
+  G.boss().cd[0] = 0; G.boss().drift = 0; G.boss().angle = 1.0;
+  G.nodes[0].angle = 1.0;
+  G.update(0.05);
+}
+check('draining the core to zero wins the level', G.getState() === G.S.END && G.getEndWin() === true);
+check('campaign completion recorded', G.progress.stars[7] > 0);
+
+// ================= endless mode =================
+G.setState(G.S.MENU);
+G.setMenuScroll(1e9); // scroll to the bottom of the list (drawMenu clamps)
+G.frame(16);
+const eBtn = G.menuBtns().find(b => b.endless);
+check('endless key appears unlocked after clearing the campaign', !!eBtn && !eBtn.locked);
+G.menuTap(eBtn.x + 10, eBtn.y + 10, 1);
+check('tapping the endless key starts an endless run', G.getState() === G.S.PLAY && G.isEndless() && G.getLV().name === 'ENDLESS STREAM');
+G.setScore(1234);
+G.setIntegrity(0);
+G.update(0.01);
+check('endless defeat records the best score', G.getState() === G.S.END && G.progress.best === 1234);
+
+// ================= tutorial =================
+G.progress.tutorialDone = false;
+G.startLevel(0);
+check('tutorial armed on the first run of level 1', !!G.tut());
+G.update(1.1);
+const tp1 = G.enemies().find(e => e.tut === 'L');
+check('tutorial spawns a slow left-side practice trap', !!tp1 && tp1.speedMul < 0.5);
+tp1.z = G.geo().hitZ;
+G.nodes[0].angle = tp1.angle + 1.5; G.nodes[1].angle = tp1.angle - 1.5; // miss it
+G.update(0.01);
+check('missed practice trap costs nothing', G.stats().integrity === 100 && G.stats().misses === 0);
+G.update(1.0);
+const tp2 = G.enemies().find(e => e.tut && !e.resolved && !e.dead);
+check('practice trap respawns after a miss', !!tp2);
+tp2.z = G.geo().hitZ;
+G.nodes[0].angle = tp2.angle;
+G.update(0.01); G.update(0.01);
+check('tutorial advances after the first zap', G.tut().step >= 2);
+G.update(1.3); G.update(1.3);
+const tp3 = G.enemies().find(e => e.tut === 'R' && !e.dead && !e.resolved);
+check('right-thumb practice trap spawns', !!tp3);
+tp3.z = G.geo().hitZ;
+G.nodes[1].angle = tp3.angle;
+G.update(0.01); G.update(0.01);
+G.update(1.7); G.update(1.7);
+check('tutorial completes and persists', G.tut() === null && G.progress.tutorialDone === true);
+check('spawns held during tutorial', true);
 
 // ================= Web Audio music looper =================
 const tick = () => new Promise(r => setImmediate(r));
