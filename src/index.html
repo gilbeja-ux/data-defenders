@@ -577,14 +577,23 @@ function dialCenter(side) {
   const m = Math.min(W, H) * 0.17;
   return side === 'L' ? { x: m * 0.95, y: H - m * 0.95, r: m * 0.72 } : { x: W - m * 0.95, y: H - m * 0.95, r: m * 0.72 };
 }
-// try to go fullscreen + lock landscape (works on Android; iOS shows rotate prompt instead)
-let lockTried = false;
+// go fullscreen + lock landscape whenever we aren't already — retried on every
+// touch so exiting fullscreen (or a failed first attempt) recovers on the next tap.
+// Works on Android Chrome; iPhone Safari has no element fullscreen — there the
+// home-screen standalone mode is the fullscreen path.
 function tryLockLandscape() {
-  if (lockTried) return; lockTried = true;
   try {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return;
+    // standalone/installed PWA is already chromeless — don't fight it
+    if ((window.matchMedia && window.matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches) ||
+        window.navigator.standalone) return;
     const el = document.documentElement;
-    const fs = el.requestFullscreen ? el.requestFullscreen() : Promise.reject();
-    fs.then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req) return;
+    const fs = req.call(el);
+    if (fs && fs.then) {
+      fs.then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
+    }
   } catch (e) {}
 }
 function pointerAngle(side, px, py) {
