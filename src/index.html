@@ -57,8 +57,7 @@ const settings = { sound: true, soundVol: 0.8, music: true, musicVol: 0.5 };
 function applySettings() {
   saveState();
   if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
-  const el = currentMusicEl();
-  if (el) el.volume = musicVolume();
+  updateMusic(); // volumes live on the takes; nudge now for instant slider feedback
 }
 function audio() {
   if (!AC) {
@@ -84,28 +83,110 @@ function tone(freq, dur, type, vol, slideTo, dest) {
 }
 // ---------- soundtrack (MUSIC_DATA is injected in a script at the end of this file) ----------
 // menu: View From The Dashboard · L1: Sub Level Three · L2: Steel and Rain · L3: Terminal Velocity
-let musicEls = null, currentTrackKey = null;
+// each track gets two <audio> "takes"; near the end of one, the twin starts from 0
+// and they equal-power crossfade — a native `loop` mp3 always has an audible seam
+let musicEls = null, currentTrackKey = null, musicUnlocked = false;
+let musicFade = 1; // 0→1 whenever a track starts from silence
 const musicVolume = () => settings.music ? settings.musicVol : 0;
+const XFADE = 1.8;        // seconds of overlap at the loop seam
+const MUSIC_FADEIN = 2.2; // seconds to fade a track in
+function makeLooper(src) {
+  const l = { els: [new Audio(src), new Audio(src)], active: 0 };
+  l.els.forEach(a => { a.preload = 'auto'; });
+  return l;
+}
 function ensureMusicEls() {
   if (musicEls || !window.MUSIC_DATA) return;
   try {
-    musicEls = { menu: new Audio(window.MUSIC_DATA.menu), levels: window.MUSIC_DATA.levels.map(s => new Audio(s)) };
-    [musicEls.menu, ...musicEls.levels].forEach(a => { a.loop = true; a.preload = 'auto'; });
+    musicEls = { menu: makeLooper(window.MUSIC_DATA.menu), levels: window.MUSIC_DATA.levels.map(makeLooper) };
   } catch (e) { musicEls = null; }
 }
-function currentMusicEl() {
+function currentLooper() {
   if (!musicEls || currentTrackKey === null) return null;
   return currentTrackKey === 'menu' ? musicEls.menu : musicEls.levels[currentTrackKey];
+}
+function stopLooper(l) {
+  for (const a of l.els) { a.pause(); try { a.currentTime = 0; } catch (e) {} }
+}
+// prime every take inside the first user gesture so later programmatic
+// crossfade play() calls aren't blocked (iOS/WebView autoplay policy)
+function unlockMusic(skipEl) {
+  if (musicUnlocked || !musicEls) return;
+  musicUnlocked = true;
+  for (const l of [musicEls.menu, ...musicEls.levels]) for (const a of l.els) {
+    if (a === skipEl || !a.paused) continue;
+    a.__unlocking = true; a.muted = true;
+    a.play().then(() => {
+      // a later playTrack may have claimed this take mid-unlock — leave it alone then
+      if (a.__unlocking) { a.pause(); try { a.currentTime = 0; } catch (e) {} }
+      a.muted = false; a.__unlocking = false;
+    }).catch(() => {
+      a.muted = false; a.__unlocking = false;
+      musicUnlocked = false; // blocked (no gesture yet) — retry on the next playTrack
+    });
+  }
+}
+// claim a take for real playback, cancelling any in-flight unlock on it
+function claimTake(a) {
+  a.__unlocking = false; a.muted = false;
 }
 function playTrack(key) {
   ensureMusicEls(); if (!musicEls) return;
   if (key !== currentTrackKey) {
-    const old = currentMusicEl();
-    if (old) { old.pause(); old.currentTime = 0; }
+    const old = currentLooper();
+    if (old) stopLooper(old);
     currentTrackKey = key;
   }
-  const el = currentMusicEl();
-  if (el) { el.volume = musicVolume(); if (el.paused) el.play().catch(() => {}); }
+  const L = currentLooper();
+  unlockMusic(L ? L.els[L.active] : null);
+  if (L) {
+    const cur = L.els[L.active];
+    // "playing" while __unlocking means it's only doing the muted unlock — still fresh
+    const fresh = cur.paused || cur.__unlocking;
+    claimTake(cur);
+    if (fresh) {
+      musicFade = 0; cur.volume = 0; // rise from silence
+      try { cur.currentTime = 0; } catch (e) {}
+      if (cur.paused) cur.play().catch(() => {});
+    }
+  }
+}
+// runs every frame: drives fade-in, volumes and the crossfade at the loop seam
+function updateMusic(dt) {
+  musicFade = Math.min(1, musicFade + (dt || 0) / MUSIC_FADEIN);
+  const L = currentLooper(); if (!L) return;
+  const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
+  const vol = musicVolume() * f;
+  const cur = L.els[L.active], nxt = L.els[1 - L.active];
+  if (cur.ended || (cur.paused && !nxt.paused)) { // seam passed — the twin carries on
+    cur.pause(); try { cur.currentTime = 0; } catch (e) {}
+    claimTake(nxt);
+    if (nxt.paused) nxt.play().catch(() => {});
+    nxt.volume = vol;
+    L.active = 1 - L.active;
+    return;
+  }
+  if (cur.paused || !isFinite(cur.duration) || !cur.duration) return;
+  const rem = cur.duration - cur.currentTime;
+  if (rem <= XFADE) {
+    if (nxt.paused || nxt.__unlocking) {
+      claimTake(nxt);
+      try { nxt.currentTime = 0; } catch (e) {}
+      nxt.volume = 0;
+      nxt.play().catch(() => {});
+    }
+    const t = clamp(rem / XFADE, 0, 1); // 1 at fade start → 0 at track end
+    cur.volume = vol * Math.sin(t * Math.PI / 2);
+    nxt.volume = vol * Math.cos(t * Math.PI / 2);
+    if (rem <= 0.06) {
+      cur.pause(); try { cur.currentTime = 0; } catch (e) {}
+      nxt.volume = vol;
+      L.active = 1 - L.active;
+    }
+  } else {
+    cur.volume = vol;
+    if (!nxt.paused) { nxt.pause(); try { nxt.currentTime = 0; } catch (e) {} }
+  }
 }
 const sfx = {
   zap()  { tone(880, 0.12, 'square', 0.10, 220); tone(1760, 0.08, 'sawtooth', 0.05, 440); },
@@ -294,9 +375,11 @@ function drawWallCode(g, dt) {
 
 // ---------- levels ----------
 const LEVELS = [
-  { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.5, spawnMax: 2.3, speed: 0.34, doubles: 0.00, crawlers: 0.00 },
-  { name: 'CITY GRID',      duration: 55, spawnMin: 1.0, spawnMax: 1.8, speed: 0.42, doubles: 0.30, crawlers: 0.00 },
-  { name: 'GLOBAL BACKBONE',duration: 70, spawnMin: 0.75,spawnMax: 1.5, speed: 0.50, doubles: 0.40, crawlers: 0.35 }
+  { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.5, spawnMax: 2.3, speed: 0.34, doubles: 0.00, crawlers: 0.00, heavies: 0.00, lines: 0.00 },
+  { name: 'CITY GRID',      duration: 55, spawnMin: 1.0, spawnMax: 1.8, speed: 0.42, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00,
+    hint: 'NEW THREAT: heavy traps — pin them with BOTH nodes' },
+  { name: 'GLOBAL BACKBONE',duration: 70, spawnMin: 0.75,spawnMax: 1.5, speed: 0.50, doubles: 0.40, crawlers: 0.35, heavies: 0.22, lines: 0.22,
+    hint: 'NEW THREAT: barrier lines — one node on each end' }
 ];
 const progress = { unlocked: 1, stars: [0, 0, 0] };
 
@@ -324,6 +407,7 @@ let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let endWin = false, endStars = 0, endT = 0;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
+let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null;
 const pauseDrag = {};
 
 // nodes: [left(blue), right(white)]
@@ -354,34 +438,55 @@ function ring(z, g) {
 }
 
 // ---------- enemies ----------
-function spawnEnemy(forcedAngle) {
+// enemy types:
+//   'normal' — any node zaps it (crawlers are drifting normals)
+//   'heavy'  — must be covered by BOTH nodes at the same time
+//   'line'   — spawned as a linked pair at the same depth; each end needs its own node
+function spawnEnemy(forcedAngle, type) {
+  type = type || 'normal';
+  const heavy = type === 'heavy';
   const L = LEVELS[levelIdx];
-  const crawler = Math.random() < L.crawlers;
+  const crawler = type === 'normal' && Math.random() < L.crawlers;
   // per-enemy iridescent crystal cluster + dense branching filaments (stable random shapes)
   const shards = [];
-  const nS = 11 + (Math.random() * 4 | 0);
+  const nS = (heavy ? 15 : 11) + (Math.random() * 4 | 0);
   for (let i = 0; i < nS; i++) {
     shards.push({ a: i / nS * TAU + rand(-0.3, 0.3), r: rand(0.45, 1.05), w: rand(0.25, 0.55), tone: Math.random(), hue: Math.random() });
   }
   const tendrils = [];
-  const nT = 13 + (Math.random() * 5 | 0);
+  const nT = (heavy ? 17 : 13) + (Math.random() * 5 | 0);
   for (let i = 0; i < nT; i++) {
     tendrils.push({
       a: rand(0, TAU), len: rand(1.3, 2.7), bend: rand(-0.7, 0.7), ph: rand(0, TAU),
       br: rand(0.4, 0.7), brA: rand(0.35, 0.85) * (Math.random() < 0.5 ? -1 : 1), glint: Math.random() < 0.3
     });
   }
-  enemies.push({
-    z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
+  const en = {
+    type, z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
     drift: crawler ? (Math.random() < 0.5 ? 1 : -1) * rand(0.25, 0.5) : 0,
-    crawler, spin: Math.random() * TAU, dead: false, shards, tendrils
-  });
+    crawler, sizeMul: heavy ? 1.6 : 1, speedMul: heavy ? 0.82 : 1,
+    spin: Math.random() * TAU, dead: false, shards, tendrils, partner: null
+  };
+  enemies.push(en);
+  return en;
+}
+// barrier line: two linked traps at the same depth with an energy wall strung between them
+function spawnLine() {
+  const a = Math.random() * TAU;
+  const gap = rand(0.8, 1.5) * (Math.random() < 0.5 ? -1 : 1);
+  const e1 = spawnEnemy(a, 'line');
+  const e2 = spawnEnemy(a + gap, 'line');
+  e1.partner = e2; e2.partner = e1;
+  e1.lineLead = true; // the pair's beam and hit test are handled once, by the lead
 }
 function trySpawn(dt) {
   spawnT -= dt;
   if (spawnT <= 0) {
     const L = LEVELS[levelIdx];
     spawnT = rand(L.spawnMin, L.spawnMax);
+    const roll = Math.random();
+    if (roll < L.lines) { spawnLine(); return; }
+    if (roll < L.lines + L.heavies) { spawnEnemy(undefined, 'heavy'); return; }
     const a = Math.random() * TAU;
     spawnEnemy(a);
     if (Math.random() < L.doubles) spawnEnemy(a + Math.PI + rand(-0.6, 0.6));
@@ -427,7 +532,7 @@ canvas.addEventListener('pointerdown', e => {
   audio();
   if (e.pointerType === 'touch') tryLockLandscape();
   const P = evPos(e);
-  if (state === S.MENU) { menuTap(P.x, P.y); return; }
+  if (state === S.MENU) { menuTap(P.x, P.y, e.pointerId); return; }
   if (state === S.END)  { endTap(P.x, P.y); return; }
   if (state === S.PAUSE) { pauseTap(P.x, P.y, e.pointerId); return; }
   // pause button (generous hit area)
@@ -443,7 +548,7 @@ canvas.addEventListener('pointerdown', e => {
 canvas.addEventListener('pointermove', e => {
   const P = evPos(e);
   const sl = pauseDrag[e.pointerId];
-  if (sl && state === S.PAUSE) {
+  if (sl && (state === S.PAUSE || (state === S.MENU && menuSettings))) {
     settings[sl.key] = clamp((P.x - sl.x) / sl.w, 0, 1);
     applySettings();
     return;
@@ -472,7 +577,25 @@ window.addEventListener('keyup', e => { keys[e.key] = false; });
 
 // ---------- menu / end screens hit areas ----------
 let menuButtons = [];
-function menuTap(x, y) {
+function menuTap(x, y, pid) {
+  if (menuSettings) {
+    if (settingsTap(x, y, pid)) return;
+    for (const b of menuSetButtons) {
+      if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
+        menuSettings = false; sfx.tick(); return;
+      }
+    }
+    // tap outside the panel dismisses it
+    if (menuSetPanel && (x < menuSetPanel.x || x > menuSetPanel.x + menuSetPanel.w ||
+        y < menuSetPanel.y || y > menuSetPanel.y + menuSetPanel.h)) {
+      menuSettings = false; sfx.tick();
+    }
+    return;
+  }
+  if (menuGearRect && x > menuGearRect.x - 8 && x < menuGearRect.x + menuGearRect.w + 8 &&
+      y > menuGearRect.y - 8 && y < menuGearRect.y + menuGearRect.h + 8) {
+    menuSettings = true; sfx.tick(); return;
+  }
   for (const b of menuButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h && !b.locked) {
       startLevel(b.level); sfx.tick(); return;
@@ -517,6 +640,7 @@ function endLevel(win) {
 // ---------- update ----------
 function update(dt) {
   time += dt;
+  updateMusic(dt);
   tunnelScroll = (tunnelScroll + dt * (state === S.PLAY ? 1.4 : 0.5)) % 10;
   shake = Math.max(0, shake - dt * 3);
   redFlash = Math.max(0, redFlash - dt * 2);
@@ -543,31 +667,49 @@ function update(dt) {
 
   const g = geo();
   const TOL = 0.314; // angular tolerance ~18°
+  const covers = (n, a) => Math.abs(angDiff(n.angle, a)) < TOL;
+  const ringXY = a => ({ x: g.cx + Math.cos(a) * g.nodeR, y: g.cy + Math.sin(a) * g.nodeR });
 
   for (const en of enemies) {
-    en.z -= L.speed * dt;
+    en.z -= L.speed * (en.speedMul || 1) * dt;
     en.spin += dt * 4;
     if (en.drift) en.angle += en.drift * dt;
 
     if (!en.dead && !en.resolved && en.z <= g.hitZ) {
-      let hit = false;
-      for (const n of nodes) {
-        if (Math.abs(angDiff(n.angle, en.angle)) < TOL) { hit = true; break; }
+      let hit;
+      if (en.type === 'heavy') {
+        // heavy: both nodes must pin it at once
+        hit = covers(nodes[0], en.angle) && covers(nodes[1], en.angle);
+      } else if (en.type === 'line') {
+        // barrier: one node on each end, either assignment
+        const p = en.partner;
+        hit = (covers(nodes[0], en.angle) && covers(nodes[1], p.angle)) ||
+              (covers(nodes[1], en.angle) && covers(nodes[0], p.angle));
+      } else {
+        hit = covers(nodes[0], en.angle) || covers(nodes[1], en.angle);
       }
-      const ex = g.cx + Math.cos(en.angle) * g.nodeR, ey = g.cy + Math.sin(en.angle) * g.nodeR;
+      const { x: ex, y: ey } = ringXY(en.angle);
       if (hit) {
         en.dead = true;
         combo++;
-        const pts = 100 * Math.min(combo, 5);
+        const base = en.type === 'heavy' ? 250 : en.type === 'line' ? 300 : 100;
+        const pts = base * Math.min(combo, 5);
         score += pts; zaps++;
         burst(ex, ey, '#bfeaff', 26, 4);
         burst(ex, ey, '#ffffff', 14, 5);
+        if (en.partner) {
+          en.partner.dead = true;
+          const p2 = ringXY(en.partner.angle);
+          burst(p2.x, p2.y, '#bfeaff', 26, 4);
+          burst(p2.x, p2.y, '#ffffff', 14, 5);
+        }
         popup(ex, ey, '+' + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), '#bfeaff');
-        shake = Math.min(shake + 0.35, 0.8);
+        shake = Math.min(shake + (en.type === 'normal' ? 0.35 : 0.5), 0.8);
         sfx.zap();
-        if (navigator.vibrate) navigator.vibrate(18);
+        if (navigator.vibrate) navigator.vibrate(en.type === 'normal' ? 18 : 30);
       } else {
         en.resolved = true; // slips past the ring and flies by the player
+        if (en.partner) en.partner.resolved = true; // the pair fails as one
         misses++; combo = 0;
         integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
         burst(ex, ey, '#ff4a5e', 20, 3);
@@ -672,7 +814,7 @@ function drawEnemy(en, g) {
   const rg = ring(Math.max(en.z, 0.02), g);
   const x = rg.x + Math.cos(en.angle) * rg.r;
   const y = rg.y + Math.sin(en.angle) * rg.r;
-  let size = lerp(4, Math.min(W, H) * 0.06, 1 - en.z);
+  let size = lerp(4, Math.min(W, H) * 0.06, 1 - en.z) * (en.sizeMul || 1);
   const near = 1 - en.z;
   // missed traps balloon past the ring and dissolve; fresh ones fade in from the deep
   let fade = en.resolved ? clamp(en.z / g.hitZ, 0, 1) : 1;
@@ -680,7 +822,11 @@ function drawEnemy(en, g) {
   if (fade <= 0.005) return;
   if (en.resolved) size *= 1 + (1 - clamp(en.z / g.hitZ, 0, 1)) * 1.6;
   // iridescent palettes — like the sprite: rich, varied facets, tinted hostile red/orange
-  const PAL = en.crawler
+  const PAL = en.type === 'heavy'
+    ? { glow: '200,70,255', tendril: '#4a1060', tendrilHi: '#d98cff',
+        shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'],
+        lights: ['#eab8ff', '#f3d4ff', '#d98cff'] }
+    : en.crawler
     ? { glow: '255,150,40', tendril: '#8a4a12', tendrilHi: '#ffb361',
         shades: ['#ff8c2a', '#e05e14', '#ffb340', '#c24a08', '#ff7a50'],
         lights: ['#ffd98f', '#ffe9c0', '#ffb361'] }
@@ -760,13 +906,58 @@ function drawEnemy(en, g) {
   // molten amber core burning through the facets
   const cg = ctx.createRadialGradient(-size * 0.12, -size * 0.14, 0, 0, 0, size * 0.48);
   cg.addColorStop(0, '#ffffff');
-  cg.addColorStop(0.3, '#ffd24a');
-  cg.addColorStop(0.7, en.crawler ? '#ff8c2a' : '#ff5a3c');
+  cg.addColorStop(0.3, en.type === 'heavy' ? '#e08cff' : '#ffd24a');
+  cg.addColorStop(0.7, en.type === 'heavy' ? '#b03ae8' : en.crawler ? '#ff8c2a' : '#ff5a3c');
   cg.addColorStop(1, 'rgba(255,90,60,0)');
   ctx.fillStyle = cg;
   ctx.beginPath(); ctx.arc(0, 0, size * 0.48 * pulse, 0, TAU); ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,0.75)';
   ctx.beginPath(); ctx.ellipse(-size * 0.14, -size * 0.17, size * 0.1, size * 0.06, -0.6, 0, TAU); ctx.fill();
+  // heavy: dual-lock sigil — orbiting dots in the two node colors, telegraphing "both nodes"
+  if (en.type === 'heavy' && near > 0.15) {
+    const sa = clamp((near - 0.15) / 0.3, 0, 1) * fade;
+    const oa = en.spin * 1.4, or2 = size * 1.08;
+    ctx.globalAlpha = sa * 0.55;
+    ctx.strokeStyle = 'rgba(230,245,255,0.9)'; ctx.lineWidth = Math.max(0.8, size * 0.05);
+    ctx.beginPath(); ctx.arc(0, 0, or2, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = sa;
+    const ds = Math.max(1.5, size * 0.13);
+    ctx.fillStyle = 'rgb(111,227,255)';
+    ctx.beginPath(); ctx.arc(Math.cos(oa) * or2, Math.sin(oa) * or2, ds, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(Math.cos(oa + Math.PI) * or2, Math.sin(oa + Math.PI) * or2, ds, 0, TAU); ctx.fill();
+    ctx.globalAlpha = fade;
+  }
+  ctx.restore();
+}
+
+// energy wall strung between the two ends of a barrier pair — drawn under the traps
+function drawLineBeam(en, g) {
+  const p = en.partner;
+  if (!p || (en.dead && p.dead)) return;
+  const rg = ring(Math.max(en.z, 0.02), g);
+  const x1 = rg.x + Math.cos(en.angle) * rg.r, y1 = rg.y + Math.sin(en.angle) * rg.r;
+  const x2 = rg.x + Math.cos(p.angle) * rg.r, y2 = rg.y + Math.sin(p.angle) * rg.r;
+  let fade = en.resolved ? clamp(en.z / g.hitZ, 0, 1) : 1;
+  fade *= clamp((1.08 - en.z) / 0.18, 0, 1);
+  if (fade <= 0.005) return;
+  const size = lerp(4, Math.min(W, H) * 0.06, 1 - en.z);
+  // crackling midpoint gives the wall a live, electric bow
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const dx = x2 - x1, dy = y2 - y1;
+  const dl = Math.hypot(dx, dy) || 1;
+  const wob = Math.sin(time * 13 + en.spin) * size * 0.45;
+  const cx2 = mx - dy / dl * wob, cy2 = my + dx / dl * wob;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.globalAlpha = fade * 0.55;
+  ctx.strokeStyle = 'rgba(255,60,90,0.75)';
+  ctx.lineWidth = Math.max(2, size * 0.5);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.quadraticCurveTo(cx2, cy2, x2, y2); ctx.stroke();
+  ctx.globalAlpha = fade * 0.9;
+  ctx.strokeStyle = 'rgba(255,180,195,0.9)';
+  ctx.lineWidth = Math.max(0.8, size * 0.12);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.quadraticCurveTo(cx2, cy2, x2, y2); ctx.stroke();
   ctx.restore();
 }
 
@@ -876,15 +1067,27 @@ function drawDials() {
     ctx.fillStyle = n.color; ctx.fill();
     ctx.strokeStyle = i === 0 ? '#7db2ff' : '#9fc4e0'; ctx.lineWidth = 2; ctx.stroke();
     // radar blips: live enemy positions — angle matches the tunnel, radius = how close they are
+    const blipXY = en => {
+      const rr = d.r * (1 - clamp(en.z, 0, 1) * 0.85);
+      return { x: d.x + Math.cos(en.angle) * rr, y: d.y + Math.sin(en.angle) * rr };
+    };
     for (const en of enemies) {
       if (en.dead || en.resolved) continue;
-      const rr = d.r * (1 - clamp(en.z, 0, 1) * 0.85);
-      const bx = d.x + Math.cos(en.angle) * rr, by = d.y + Math.sin(en.angle) * rr;
-      const bs = 2.5 + (1 - en.z) * 4;
+      const { x: bx, y: by } = blipXY(en);
+      const bs = (2.5 + (1 - en.z) * 4) * (en.type === 'heavy' ? 1.5 : 1);
       const urgent = en.z < 0.35 && Math.sin(time * 10) > 0; // blink when close
-      ctx.fillStyle = en.crawler
-        ? `rgba(255,140,40,${urgent || en.z >= 0.35 ? 0.95 : 0.4})`
-        : `rgba(220,50,50,${urgent || en.z >= 0.35 ? 0.95 : 0.4})`;
+      const al = urgent || en.z >= 0.35 ? 0.95 : 0.4;
+      // barrier pairs show their wall on the radar too
+      if (en.lineLead && en.partner && !en.partner.dead) {
+        const p2 = blipXY(en.partner);
+        ctx.strokeStyle = `rgba(255,80,110,${al * 0.6})`; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+      }
+      ctx.fillStyle = en.type === 'heavy'
+        ? `rgba(200,80,255,${al})`
+        : en.crawler
+        ? `rgba(255,140,40,${al})`
+        : `rgba(220,50,50,${al})`;
       ctx.fillRect(bx - bs / 2, by - bs / 2, bs, bs);
     }
   }
@@ -900,13 +1103,79 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
+// ---------- holographic HUD kit ----------
+// chamfered slab — corners cut on the top-left / bottom-right diagonal
+function techRect(x, y, w, h, cut) {
+  ctx.beginPath();
+  ctx.moveTo(x + cut, y);
+  ctx.lineTo(x + w, y);
+  ctx.lineTo(x + w, y + h - cut);
+  ctx.lineTo(x + w - cut, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.lineTo(x, y + cut);
+  ctx.closePath();
+}
+// floating bracket corners, like a target lock
+function cornerBrackets(x, y, w, h, len, col) {
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y);
+  ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len);
+  ctx.moveTo(x + w, y + h - len); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - len, y + h);
+  ctx.moveTo(x + len, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - len);
+  ctx.stroke();
+}
+// cluster of small + marks — HUD garnish
+function plusCluster(x, y, col) {
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+  const s = 3.5, gap = 12;
+  for (let i = 0; i < 8; i++) {
+    if (i === 3 || i === 6) continue; // ragged edge, like the mock
+    const cx2 = x + (i % 4) * gap, cy2 = y + ((i / 4) | 0) * gap;
+    ctx.beginPath();
+    ctx.moveTo(cx2 - s, cy2); ctx.lineTo(cx2 + s, cy2);
+    ctx.moveTo(cx2, cy2 - s); ctx.lineTo(cx2, cy2 + s);
+    ctx.stroke();
+  }
+}
+// glass console panel with a luminous header band; returns the header height
+function techPanel(x, y, w, h, title) {
+  const cut = 16;
+  techRect(x, y, w, h, cut);
+  ctx.fillStyle = 'rgba(4,14,30,0.92)'; ctx.fill();
+  ctx.shadowColor = 'rgba(95,215,255,0.55)'; ctx.shadowBlur = 16;
+  ctx.strokeStyle = 'rgba(110,210,255,0.65)'; ctx.lineWidth = 1.5;
+  techRect(x, y, w, h, cut); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(110,210,255,0.16)'; ctx.lineWidth = 1;
+  techRect(x + 4, y + 4, w - 8, h - 8, cut - 3); ctx.stroke();
+  const hh = 32;
+  ctx.save();
+  techRect(x, y, w, h, cut); ctx.clip();
+  const hg = ctx.createLinearGradient(x, y, x + w * 0.85, y);
+  hg.addColorStop(0, 'rgba(80,190,255,0.35)');
+  hg.addColorStop(1, 'rgba(80,190,255,0.02)');
+  ctx.fillStyle = hg; ctx.fillRect(x, y, w, hh);
+  ctx.strokeStyle = 'rgba(120,220,255,0.5)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x, y + hh); ctx.lineTo(x + w, y + hh); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = '#cfeeff';
+  try { ctx.letterSpacing = '3px'; } catch (e) {}
+  ctx.font = '700 13px system-ui'; ctx.textAlign = 'left';
+  ctx.fillText(title, x + 20, y + 21);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  cornerBrackets(x - 7, y - 7, w + 14, h + 14, 14, 'rgba(120,220,255,0.55)');
+  return hh;
+}
+
 function drawHUD(g) {
   const L = LEVELS[levelIdx];
   const pad = 14;
 
-  // level intro title — fades out as the run begins
-  if (levelT < 2.4) {
-    const a = levelT < 1.8 ? 1 : (2.4 - levelT) / 0.6;
+  // level intro title — fades out as the run begins (lingers longer when there's a threat hint)
+  const introDur = L.hint ? 3.6 : 2.4;
+  if (levelT < introDur) {
+    const a = levelT < introDur - 0.6 ? 1 : (introDur - levelT) / 0.6;
     ctx.textAlign = 'center';
     ctx.globalAlpha = a;
     try { ctx.letterSpacing = '5px'; } catch (e) {}
@@ -917,14 +1186,21 @@ function drawHUD(g) {
     ctx.fillText(L.name, W / 2, H * 0.16 + 30);
     ctx.shadowBlur = 0;
     try { ctx.letterSpacing = '0px'; } catch (e) {}
+    if (L.hint) {
+      ctx.fillStyle = '#ffb8c8'; ctx.font = '600 13px system-ui';
+      ctx.fillText(L.hint, W / 2, H * 0.16 + 54);
+    }
     ctx.globalAlpha = 1;
     ctx.textAlign = 'left';
   }
 
   // left curved bar: LEVEL PROGRESS (green, hugs the node ring like the mock)
-  const barR = g.nodeR + Math.min(W, H) * 0.095;
+  // radius is clamped so the arc tips + stroke casing always stay on screen —
+  // on wide phones the unclamped radius pushed the tips past the top edge
   const bw2 = Math.max(9, Math.min(W, H) * 0.024);
-  const aL0 = Math.PI * 1.06, aL1 = Math.PI * 1.38; // lower-left → upper-left
+  const ELEV = Math.PI * 0.34; // how far above horizontal the arc tips rise
+  const barR = Math.min(g.nodeR + Math.min(W, H) * 0.095, (H / 2 - bw2 - 8) / Math.sin(ELEV));
+  const aL0 = Math.PI * 1.06, aL1 = Math.PI + ELEV; // lower-left → upper-left
   ctx.lineCap = 'round';
   ctx.strokeStyle = 'rgba(240,250,255,0.85)'; ctx.lineWidth = bw2 + 5;
   ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
@@ -939,7 +1215,7 @@ function drawHUD(g) {
 
   // right curved bar: 4 life blocks joined into one bar — no outline, just the blocks
   const MAXM = 4, blocksLeft = Math.max(0, Math.ceil(integrity / 25));
-  const aR0 = -Math.PI * 0.06, aR1 = -Math.PI * 0.38; // mirrored: lower-right → upper-right
+  const aR0 = -Math.PI * 0.06, aR1 = -ELEV; // mirrored: lower-right → upper-right
   const span = (aR0 - aR1) / MAXM, gap2 = span * 0.07; // thin seams keep them reading as one bar
   ctx.lineCap = 'butt';
   for (let i = 0; i < MAXM; i++) {
@@ -968,12 +1244,69 @@ function drawHUD(g) {
 
   // pause button (top-left)
   pauseBtnRect = { x: 12, y: 12, w: 38, h: 38 };
-  roundRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 10);
-  ctx.fillStyle = 'rgba(10,20,45,0.55)'; ctx.fill();
-  ctx.strokeStyle = 'rgba(120,170,255,0.45)'; ctx.lineWidth = 1.5; ctx.stroke();
-  ctx.fillStyle = 'rgba(230,242,255,0.9)';
+  techRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 8);
+  ctx.fillStyle = 'rgba(6,20,40,0.6)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(120,220,255,0.55)'; ctx.lineWidth = 1.5;
+  techRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 8); ctx.stroke();
+  ctx.fillStyle = 'rgba(220,245,255,0.92)';
   ctx.fillRect(pauseBtnRect.x + 12, pauseBtnRect.y + 11, 5, 16);
   ctx.fillRect(pauseBtnRect.x + 21, pauseBtnRect.y + 11, 5, 16);
+}
+
+// one audio channel row: label · angular toggle · tick-marked slider (shared by pause + menu)
+function settingRow(label, key, volKey, y, px, pw) {
+  ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(160,225,255,0.95)';
+  try { ctx.letterSpacing = '2px'; } catch (e) {}
+  ctx.font = '700 12px system-ui';
+  ctx.fillText(label, px + 24, y + 4);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  // angular toggle slab
+  const tx = px + 96, tw = 52, th = 24, on = settings[key];
+  techRect(tx, y - th / 2, tw, th, 6);
+  ctx.fillStyle = on ? 'rgba(40,140,210,0.55)' : 'rgba(255,255,255,0.06)'; ctx.fill();
+  ctx.strokeStyle = on ? 'rgba(140,230,255,0.8)' : 'rgba(120,180,255,0.3)'; ctx.lineWidth = 1.5;
+  techRect(tx, y - th / 2, tw, th, 6); ctx.stroke();
+  const ks = th - 9;
+  ctx.fillStyle = on ? '#dff6ff' : 'rgba(160,190,230,0.45)';
+  ctx.fillRect(on ? tx + tw - ks - 4.5 : tx + 4.5, y - ks / 2, ks, ks);
+  pauseTogglesList.push({ x: tx, y: y - th / 2, w: tw, h: th, key });
+  // volume rail with depth ticks and a diamond cursor
+  const sx = tx + tw + 26, sw2 = px + pw - 36 - sx;
+  ctx.lineCap = 'butt';
+  ctx.strokeStyle = 'rgba(120,200,255,0.16)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2, y); ctx.stroke();
+  ctx.strokeStyle = 'rgba(120,200,255,0.35)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 8; i++) {
+    const tx2 = sx + sw2 * i / 8;
+    ctx.beginPath(); ctx.moveTo(tx2, y + 6); ctx.lineTo(tx2, y + 10); ctx.stroke();
+  }
+  const v = settings[volKey];
+  ctx.strokeStyle = on ? 'rgba(111,227,255,0.9)' : 'rgba(120,150,200,0.3)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2 * v, y); ctx.stroke();
+  ctx.save();
+  ctx.translate(sx + sw2 * v, y); ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = on ? '#eafaff' : 'rgba(200,210,230,0.5)';
+  ctx.fillRect(-6, -6, 12, 12);
+  ctx.strokeStyle = on ? 'rgba(111,227,255,0.9)' : 'rgba(160,190,230,0.4)'; ctx.lineWidth = 1.5;
+  ctx.strokeRect(-6, -6, 12, 12);
+  ctx.restore();
+  ctx.lineCap = 'round';
+  pauseSlidersList.push({ x: sx, y, w: sw2, key: volKey });
+}
+// shared toggle/slider hit test — returns true if the tap landed on a control
+function settingsTap(x, y, pid) {
+  for (const t of pauseTogglesList) {
+    if (x > t.x - 8 && x < t.x + t.w + 8 && y > t.y - 8 && y < t.y + t.h + 8) {
+      settings[t.key] = !settings[t.key]; applySettings(); sfx.tick(); return true;
+    }
+  }
+  for (const s of pauseSlidersList) {
+    if (x > s.x - 14 && x < s.x + s.w + 14 && Math.abs(y - s.y) < 20) {
+      settings[s.key] = clamp((x - s.x) / s.w, 0, 1); applySettings();
+      pauseDrag[pid] = s; return true;
+    }
+  }
+  return false;
 }
 
 function drawPause() {
@@ -981,36 +1314,12 @@ function drawPause() {
   ctx.fillStyle = 'rgba(3,6,14,0.78)'; ctx.fillRect(0, 0, W, H);
   const pw = Math.min(W * 0.74, 540), ph = Math.min(H * 0.84, 320);
   const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
-  roundRect(px, py, pw, ph, 18);
-  ctx.fillStyle = 'rgba(8,16,36,0.96)'; ctx.fill();
-  ctx.strokeStyle = 'rgba(90,160,255,0.45)'; ctx.lineWidth = 1.5; ctx.stroke();
-  ctx.textAlign = 'center'; ctx.fillStyle = '#eaf4ff'; ctx.font = '800 22px system-ui';
-  ctx.fillText('PAUSED', W / 2, py + 38);
-
-  function settingRow(label, key, volKey, y) {
-    ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = '700 13px system-ui';
-    ctx.fillText(label, px + 24, y + 5);
-    // toggle pill
-    const tx = px + 92, tw = 52, th = 26, on = settings[key];
-    roundRect(tx, y - th / 2, tw, th, th / 2);
-    ctx.fillStyle = on ? '#2461d9' : 'rgba(255,255,255,0.15)'; ctx.fill();
-    ctx.beginPath(); ctx.arc(tx + (on ? tw - th / 2 : th / 2), y, th / 2 - 3, 0, TAU);
-    ctx.fillStyle = '#fff'; ctx.fill();
-    pauseTogglesList.push({ x: tx, y: y - th / 2, w: tw, h: th, key });
-    // volume slider
-    const sx = tx + tw + 26, sw2 = px + pw - 36 - sx;
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 5;
-    ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2, y); ctx.stroke();
-    const v = settings[volKey];
-    ctx.strokeStyle = on ? '#4d8dff' : 'rgba(120,150,200,0.35)';
-    ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx + sw2 * v, y); ctx.stroke();
-    ctx.beginPath(); ctx.arc(sx + sw2 * v, y, 9, 0, TAU);
-    ctx.fillStyle = on ? '#fff' : 'rgba(200,210,230,0.5)'; ctx.fill();
-    pauseSlidersList.push({ x: sx, y, w: sw2, key: volKey });
-  }
-  settingRow('SFX',   'sound', 'soundVol', py + 78);
-  settingRow('MUSIC', 'music', 'musicVol', py + 128);
+  techPanel(px, py, pw, ph, 'SYSTEM PAUSED');
+  settingRow('SFX',   'sound', 'soundVol', py + 84,  px, pw);
+  settingRow('MUSIC', 'music', 'musicVol', py + 132, px, pw);
+  // live console readout, pure garnish
+  ctx.fillStyle = 'rgba(120,210,255,0.35)'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
+  ctx.fillText('m_fSfxVol = ' + settings.soundVol.toFixed(2) + 'f;   m_fMusicVol = ' + settings.musicVol.toFixed(2) + 'f;', px + 24, py + 170);
 
   const bh = 46, gap = 12, bw = (pw - 48 - gap * 2) / 3;
   let bx = px + 24; const by = py + ph - bh - 24;
@@ -1023,17 +1332,7 @@ function drawPause() {
 }
 
 function pauseTap(x, y, pid) {
-  for (const t of pauseTogglesList) {
-    if (x > t.x - 8 && x < t.x + t.w + 8 && y > t.y - 8 && y < t.y + t.h + 8) {
-      settings[t.key] = !settings[t.key]; applySettings(); sfx.tick(); return;
-    }
-  }
-  for (const s of pauseSlidersList) {
-    if (x > s.x - 14 && x < s.x + s.w + 14 && Math.abs(y - s.y) < 20) {
-      settings[s.key] = clamp((x - s.x) / s.w, 0, 1); applySettings();
-      pauseDrag[pid] = s; return;
-    }
-  }
+  if (settingsTap(x, y, pid)) return;
   for (const b of pauseButtonsList) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
       sfx.tick();
@@ -1067,19 +1366,38 @@ function drawStars(cx, cy, count, size, t) {
 }
 
 function button(x, y, w, h, label, primary, locked) {
-  // Tron console button: dark slab, luminous edge
-  roundRect(x, y, w, h, 5);
-  ctx.fillStyle = locked ? 'rgba(255,255,255,0.05)' : primary ? 'rgba(24,90,140,0.85)' : 'rgba(6,14,24,0.85)';
+  // holographic console key: chamfered glass slab, luminous edge, energy bar on the left
+  const cut = Math.min(12, h * 0.28);
+  techRect(x, y, w, h, cut);
+  ctx.fillStyle = locked ? 'rgba(90,160,255,0.05)' : primary ? 'rgba(30,120,190,0.35)' : 'rgba(10,36,64,0.45)';
   ctx.fill();
-  if (!locked) {
-    ctx.strokeStyle = primary ? 'rgba(160,240,255,0.35)' : 'rgba(120,225,255,0.18)';
-    ctx.lineWidth = 5;
-    roundRect(x, y, w, h, 5); ctx.stroke();
-    ctx.strokeStyle = primary ? '#a8ecff' : 'rgba(120,225,255,0.75)';
+  if (locked) {
+    // hazard hatching across the disabled key
+    ctx.save();
+    techRect(x, y, w, h, cut); ctx.clip();
+    ctx.strokeStyle = 'rgba(120,180,255,0.10)'; ctx.lineWidth = 6;
+    for (let sx = x - h; sx < x + w; sx += 20) {
+      ctx.beginPath(); ctx.moveTo(sx, y + h + 2); ctx.lineTo(sx + h + 4, y - 2); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(120,180,255,0.20)'; ctx.lineWidth = 1;
+    techRect(x, y, w, h, cut); ctx.stroke();
+  } else {
+    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = primary ? 14 : 6;
+    ctx.strokeStyle = primary ? 'rgba(150,238,255,0.95)' : 'rgba(95,200,255,0.55)';
     ctx.lineWidth = 1.5;
-    roundRect(x, y, w, h, 5); ctx.stroke();
+    techRect(x, y, w, h, cut); ctx.stroke();
+    ctx.shadowBlur = 0;
+    // energy bar + bottom-right corner tick
+    ctx.fillStyle = primary ? '#a8ecff' : 'rgba(120,220,255,0.7)';
+    ctx.fillRect(x + 6, y + h * 0.28, 3, h * 0.44);
+    ctx.strokeStyle = primary ? 'rgba(168,236,255,0.9)' : 'rgba(120,220,255,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + w - cut - 8, y + h - 3.5); ctx.lineTo(x + w - cut + 2, y + h - 3.5);
+    ctx.stroke();
   }
-  ctx.fillStyle = locked ? 'rgba(255,255,255,0.25)' : primary ? '#eefaff' : '#bfeaff';
+  ctx.fillStyle = locked ? 'rgba(160,200,255,0.3)' : primary ? '#eefaff' : '#bfeaff';
   try { ctx.letterSpacing = '2px'; } catch (e) {}
   ctx.font = '600 14px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(label, x + w / 2, y + h / 2 + 1);
@@ -1087,36 +1405,204 @@ function button(x, y, w, h, label, primary, locked) {
   ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
 }
 
+// five-point star, filled gold when earned
+function star5(cx, cy, r, filled) {
+  ctx.beginPath();
+  for (let k = 0; k < 10; k++) {
+    const a = -Math.PI / 2 + k * Math.PI / 5;
+    const rr = k % 2 === 0 ? r : r * 0.46;
+    const px2 = cx + Math.cos(a) * rr, py2 = cy + Math.sin(a) * rr;
+    k === 0 ? ctx.moveTo(px2, py2) : ctx.lineTo(px2, py2);
+  }
+  ctx.closePath();
+  if (filled) {
+    ctx.fillStyle = '#ffd24a'; ctx.fill();
+    ctx.strokeStyle = 'rgba(90,60,0,0.55)'; ctx.lineWidth = 1; ctx.stroke();
+  } else {
+    ctx.strokeStyle = 'rgba(235,248,255,0.8)'; ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round'; ctx.stroke(); ctx.lineJoin = 'miter';
+  }
+}
+function padlock(cx, cy, s) {
+  ctx.strokeStyle = 'rgba(220,240,255,0.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy - s * 0.35, s * 0.55, Math.PI, 0); ctx.stroke();
+  ctx.fillStyle = 'rgba(220,240,255,0.5)';
+  roundRect(cx - s * 0.8, cy - s * 0.35, s * 1.6, s * 1.1, 2); ctx.fill();
+}
+// level select key — the game's console-key look, with the rating / lock badge on the right
+function levelKey(x, y, w, h, num, name, stars, locked, primary) {
+  const cut = Math.min(12, h * 0.28);
+  techRect(x, y, w, h, cut);
+  ctx.fillStyle = locked ? 'rgba(90,160,255,0.05)' : primary ? 'rgba(30,120,190,0.35)' : 'rgba(10,36,64,0.45)';
+  ctx.fill();
+  if (locked) {
+    ctx.save(); techRect(x, y, w, h, cut); ctx.clip();
+    ctx.strokeStyle = 'rgba(120,180,255,0.10)'; ctx.lineWidth = 6;
+    for (let sx = x - h; sx < x + w; sx += 20) {
+      ctx.beginPath(); ctx.moveTo(sx, y + h + 2); ctx.lineTo(sx + h + 4, y - 2); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(120,180,255,0.20)'; ctx.lineWidth = 1;
+    techRect(x, y, w, h, cut); ctx.stroke();
+  } else {
+    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = primary ? 14 : 6;
+    ctx.strokeStyle = primary ? 'rgba(150,238,255,0.95)' : 'rgba(95,200,255,0.55)';
+    ctx.lineWidth = 1.5;
+    techRect(x, y, w, h, cut); ctx.stroke();
+    ctx.shadowBlur = 0;
+    // energy bar + bottom-right corner tick, same as the other console keys
+    ctx.fillStyle = primary ? '#a8ecff' : 'rgba(120,220,255,0.7)';
+    ctx.fillRect(x + 6, y + h * 0.28, 3, h * 0.44);
+    ctx.strokeStyle = primary ? 'rgba(168,236,255,0.9)' : 'rgba(120,220,255,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + w - cut - 8, y + h - 3.5); ctx.lineTo(x + w - cut + 2, y + h - 3.5);
+    ctx.stroke();
+  }
+  // number + name
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.fillStyle = locked ? 'rgba(220,240,255,0.35)' : '#f2faff';
+  ctx.font = '800 15px system-ui';
+  ctx.fillText(num, x + 20, y + h / 2 + 1);
+  ctx.fillStyle = locked ? 'rgba(220,240,255,0.35)' : '#ffffff';
+  ctx.font = '700 14px system-ui';
+  try { ctx.letterSpacing = '1px'; } catch (e) {}
+  ctx.fillText(name, x + 42, y + h / 2 + 1);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.textBaseline = 'alphabetic';
+  // rating stars, or a padlock in a rounded badge
+  if (locked) {
+    roundRect(x + w - 41, y + h / 2 - 13, 26, 26, 6);
+    ctx.strokeStyle = 'rgba(220,240,255,0.55)'; ctx.lineWidth = 1.5; ctx.stroke();
+    padlock(x + w - 28, y + h / 2, 7);
+  } else {
+    for (let i = 0; i < 3; i++) star5(x + w - 70 + i * 23, y + h / 2, 8.5, i < stars);
+  }
+}
+
 function drawMenu(g) {
   menuButtons = [];
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#eafaff';
-  try { ctx.letterSpacing = '8px'; } catch (e) {}
-  ctx.font = '800 ' + Math.min(W * 0.085, 42) + 'px system-ui';
-  ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 30;
-  ctx.fillText('DATA DEFENDERS', W / 2, H * 0.2);
-  ctx.shadowBlur = 0;
-  try { ctx.letterSpacing = '0px'; } catch (e) {}
-  ctx.strokeStyle = 'rgba(120,225,255,0.5)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(W / 2 - W * 0.18, H * 0.2 + 10); ctx.lineTo(W / 2 + W * 0.18, H * 0.2 + 10); ctx.stroke();
-  ctx.fillStyle = 'rgba(180,215,255,0.8)'; ctx.font = '500 13px system-ui';
-  ctx.fillText('Guard the payload. Zap the data traps.', W / 2, H * 0.2 + 28);
-  ctx.fillStyle = 'rgba(180,215,255,0.55)'; ctx.font = '500 12px system-ui';
-  ctx.fillText('Left thumb = blue node · Right thumb = white node', W / 2, H * 0.2 + 48);
-  ctx.fillText('Slide around the dials to intercept traps on the tunnel rim', W / 2, H * 0.2 + 66);
-
-  const bw = Math.min(W * 0.68, 320), bh = isLandscape() ? 46 : 52;
-  const gap = isLandscape() ? 10 : 16, startY = isLandscape() ? H * 0.42 : H * 0.38;
-  for (let i = 0; i < LEVELS.length; i++) {
-    const bx = W / 2 - bw / 2, by = startY + i * (bh + gap);
-    const locked = i + 1 > progress.unlocked;
-    button(bx, by, bw, bh, (locked ? '🔒 ' : '') + (i + 1) + '.  ' + LEVELS[i].name, i + 1 === progress.unlocked, locked);
-    if (progress.stars[i] > 0) {
-      ctx.textAlign = 'center'; ctx.fillStyle = '#ffd24a'; ctx.font = '13px system-ui';
-      ctx.fillText('★'.repeat(progress.stars[i]) + '☆'.repeat(3 - progress.stars[i]), bx + bw / 2, by + bh + 2);
-    }
-    menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
+  // HUD garnish around the screen edges
+  plusCluster(W - 118, 26, 'rgba(120,220,255,0.45)');
+  plusCluster(W - 140, H - 40, 'rgba(120,220,255,0.25)');
+  ctx.font = '10px monospace'; ctx.textAlign = 'left';
+  // bottom-left: diagnostic carousel — count up fast, hold ~5s, then the next block
+  // in the bar lights up white and a fresh count begins
+  const CYCLE = 6.5, COUNT = 1.5;
+  const cyc = Math.floor(time / CYCLE), ct = time - cyc * CYCLE;
+  const cp = clamp(ct / COUNT, 0, 1);
+  const activeBlk = cyc % 4;
+  const grp = i => {
+    const tgt = ((cyc * 7919 + i * 337) % 90) + 10; // stable per-cycle targets, 10–99
+    return String(Math.floor(tgt * cp)).padStart(2, '0');
+  };
+  ctx.fillStyle = 'rgba(120,210,255,0.55)';
+  ctx.fillText(grp(0) + '.' + grp(1) + '.' + grp(2), 20, H - 20);
+  for (let i = 0; i < 4; i++) {
+    const active = i === activeBlk;
+    const blink = active && cp < 1 && Math.sin(time * 14) > 0; // flickers while counting
+    ctx.fillStyle = active
+      ? (blink ? 'rgba(235,250,255,0.35)' : 'rgba(235,250,255,0.9)')
+      : 'rgba(120,210,255,0.3)';
+    ctx.fillRect(20 + i * 15, H - 40, 11, 5);
   }
+  // bottom-right: live nav coordinates drifting as we ride the tunnel
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(120,210,255,0.5)';
+  ctx.fillText(String(Math.floor(44589 + time * 12.4) % 100000).padStart(5, '0'), W - 20, H - 34);
+  ctx.fillText(String(Math.floor(45895 + time * 31.7) % 100000).padStart(5, '0'), W - 20, H - 22);
+  ctx.fillStyle = 'rgba(120,210,255,0.45)'; ctx.fillRect(W - 96, H - 54, 76, 2);
+  ctx.fillStyle = 'rgba(120,210,255,0.25)'; ctx.fillRect(W - 96, H - 49, 76, 2);
+
+  // block logo — stacked DATA / DEFE / NDER, top-left
+  const fs = Math.min(H * 0.125, W * 0.055);
+  const lx = 26, llh = fs * 1.04;
+  let ly = 24 + fs;
+  ctx.textAlign = 'left';
+  ctx.font = '900 ' + fs.toFixed(0) + 'px system-ui';
+  try { ctx.letterSpacing = (fs * 0.08).toFixed(1) + 'px'; } catch (e) {}
+  ctx.shadowColor = 'rgba(0,10,30,0.85)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+  ctx.fillStyle = '#c6d6ea';
+  for (const s of ['DATA', 'DEFE', 'NDER']) { ctx.fillText(s, lx, ly); ly += llh; }
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.fillStyle = 'rgba(180,215,255,0.6)'; ctx.font = '500 11px system-ui';
+  ctx.fillText('Guard the payload.', lx + 2, ly - llh + 20);
+  ctx.fillText('Zap the data traps.', lx + 2, ly - llh + 35);
+
+  // audio config key (top-right)
+  menuGearRect = { x: W - 50, y: 12, w: 38, h: 38 };
+  const r = menuGearRect;
+  techRect(r.x, r.y, r.w, r.h, 8);
+  ctx.fillStyle = 'rgba(6,20,40,0.6)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(120,220,255,0.55)'; ctx.lineWidth = 1.5;
+  techRect(r.x, r.y, r.w, r.h, 8); ctx.stroke();
+  ctx.strokeStyle = 'rgba(200,240,255,0.9)'; ctx.lineWidth = 1.5;
+  const knobX = [r.x + 24, r.x + 13, r.x + 27];
+  for (let i = 0; i < 3; i++) {
+    const ly = r.y + 11 + i * 8;
+    ctx.beginPath(); ctx.moveTo(r.x + 8, ly); ctx.lineTo(r.x + 30, ly); ctx.stroke();
+    ctx.fillStyle = '#dff6ff';
+    ctx.fillRect(knobX[i] - 2.5, ly - 3.5, 5, 7);
+  }
+
+  // tunnel disc — a dark mouth in the center that makes the level keys pop
+  const ccx = W / 2, ccy = H / 2;
+  const R = Math.min(H * 0.52, W * 0.30);
+  const dg = ctx.createRadialGradient(ccx, ccy, R * 0.2, ccx, ccy, R);
+  dg.addColorStop(0, 'rgba(2,5,12,0.78)');
+  dg.addColorStop(0.85, 'rgba(3,8,18,0.62)');
+  dg.addColorStop(1, 'rgba(4,10,22,0.55)');
+  ctx.beginPath(); ctx.arc(ccx, ccy, R, 0, TAU);
+  ctx.fillStyle = dg; ctx.fill();
+  ctx.strokeStyle = 'rgba(100,190,255,0.14)'; ctx.lineWidth = 1.5; ctx.stroke();
+  // rounded scroll rail hugging the disc's right rim
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(12,30,55,0.9)'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, 0.42 * Math.PI); ctx.stroke();
+  ctx.strokeStyle = '#4db6ff'; ctx.lineWidth = 7;
+  ctx.shadowColor = 'rgba(90,200,255,0.8)'; ctx.shadowBlur = 8;
+  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, -0.16 * Math.PI); ctx.stroke();
+  ctx.shadowBlur = 0;
+  // header
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f2faff'; ctx.font = '700 17px system-ui';
+  try { ctx.letterSpacing = '1px'; } catch (e) {}
+  ctx.fillText('Select a level', ccx, ccy - R + 34);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  // level keys, centered in the disc
+  const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
+  const total = LEVELS.length * (bh + gap) - gap;
+  let by = ccy - total / 2 + 8;
+  for (let i = 0; i < LEVELS.length; i++) {
+    const bx = ccx - bw / 2;
+    const locked = i + 1 > progress.unlocked;
+    levelKey(bx, by, bw, bh, i + 1, LEVELS[i].name, progress.stars[i], locked, i + 1 === progress.unlocked);
+    menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
+    by += bh + gap;
+  }
+  // control hint inside the disc, under the list
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(180,215,255,0.5)'; ctx.font = '500 11px system-ui';
+  ctx.fillText('Left thumb = blue node · Right thumb = white node', ccx, by + 14);
+  ctx.textAlign = 'left';
+
+  if (menuSettings) drawMenuSettings();
+}
+
+// audio config overlay on the main menu — same controls as the pause panel
+function drawMenuSettings() {
+  pauseSlidersList = []; pauseTogglesList = []; menuSetButtons = [];
+  ctx.fillStyle = 'rgba(3,6,14,0.62)'; ctx.fillRect(0, 0, W, H);
+  const pw = Math.min(W * 0.72, 520), ph = Math.min(H * 0.8, 250);
+  const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+  menuSetPanel = { x: px, y: py, w: pw, h: ph };
+  techPanel(px, py, pw, ph, 'AUDIO CONFIG');
+  settingRow('SFX',   'sound', 'soundVol', py + 78,  px, pw);
+  settingRow('MUSIC', 'music', 'musicVol', py + 124, px, pw);
+  const bw = 160, bh = 42;
+  button(W / 2 - bw / 2, py + ph - bh - 20, bw, bh, 'CLOSE', true);
+  menuSetButtons.push({ x: W / 2 - bw / 2, y: py + ph - bh - 20, w: bw, h: bh, action: 'close' });
   ctx.textAlign = 'left';
 }
 
@@ -1124,25 +1610,36 @@ function drawEnd(g) {
   endButtons = [];
   ctx.fillStyle = 'rgba(3,6,14,0.72)';
   ctx.fillRect(0, 0, W, H);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = endWin ? '#69e05c' : '#ff4a5e';
-  ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
-  ctx.fillText(endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25);
 
-  if (endWin) drawStars(W / 2, H * 0.35, endStars, Math.min(W, H) * 0.045, endT);
-
-  ctx.fillStyle = '#eaf4ff'; ctx.font = '700 26px system-ui';
-  ctx.fillText(score.toLocaleString(), W / 2, H * 0.47);
-  ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = '500 12px system-ui';
-  ctx.fillText('SCORE', W / 2, H * 0.47 + 20);
-  ctx.fillText('Zapped ' + zaps + '   ·   Missed ' + misses + '   ·   Integrity ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
-
-  // build button list, then lay out: row in landscape, stack in portrait
+  // build button list first so the report panel can wrap everything
   const list = [];
   if (endWin && levelIdx + 1 < LEVELS.length) list.push({ label: 'NEXT LEVEL ▸', action: 'next', primary: true });
   list.push({ label: endWin ? 'REPLAY' : 'RETRY', action: 'retry', primary: !endWin });
   list.push({ label: 'MENU', action: 'menu', primary: false });
   const bh = 50;
+  const panelBottom = (isLandscape() ? H * 0.66 + bh : H * 0.62 + list.length * (bh + 14) - 14) + 24;
+  const pw = Math.min(W * 0.88, 700), pTop = H * 0.13;
+  techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + LEVELS[levelIdx].name);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = endWin ? '#69e05c' : '#ff4a5e';
+  try { ctx.letterSpacing = '4px'; } catch (e) {}
+  ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
+  ctx.shadowColor = endWin ? '#69e05c' : '#ff4a5e'; ctx.shadowBlur = 22;
+  ctx.fillText(endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
+  ctx.shadowBlur = 0;
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+
+  if (endWin) drawStars(W / 2, H * 0.36, endStars, Math.min(W, H) * 0.045, endT);
+
+  ctx.fillStyle = '#eaf4ff'; ctx.font = '700 26px system-ui';
+  ctx.fillText(score.toLocaleString(), W / 2, H * 0.47);
+  ctx.fillStyle = 'rgba(160,215,255,0.7)'; ctx.font = '600 11px system-ui';
+  try { ctx.letterSpacing = '3px'; } catch (e) {}
+  ctx.fillText('SCORE', W / 2, H * 0.47 + 20);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.fillStyle = 'rgba(140,210,255,0.65)'; ctx.font = '11px monospace';
+  ctx.fillText('zapped: ' + zaps + '   //   missed: ' + misses + '   //   integrity: ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
   if (isLandscape()) {
     const bw = Math.min(W * 0.24, 210), gap = 16;
     const total = list.length * bw + (list.length - 1) * gap;
@@ -1225,6 +1722,7 @@ function frame(now) {
 
   // traps render over the ring — missed ones fly past the player and fade
   const sorted = enemies.slice().sort((a, b) => b.z - a.z);
+  for (const en of sorted) if (en.lineLead) drawLineBeam(en, g); // beams sit under the traps
   for (const en of sorted) drawEnemy(en, g);
 
   if (state !== S.MENU) drawNodes(g);
@@ -1272,6 +1770,22 @@ function frame(now) {
 
 resize();
 requestAnimationFrame(frame);
+// try to start the soundtrack right away — the Capacitor app WebView allows it;
+// desktop browsers that block autoplay simply start it on the first tap instead
+// (deferred a tick: the MUSIC_DATA manifest script below hasn't parsed yet)
+setTimeout(() => { if (state === S.MENU) playTrack('menu'); }, 0);
+</script>
+<script>
+// ---------- soundtrack manifest ----------
+// menu: View From The Dashboard · L1: Sub Level Three · L2: Steel and Rain · L3: Terminal Velocity
+window.MUSIC_DATA = {
+  menu: 'audio/View_From_The_Dashboard.mp3',
+  levels: [
+    'audio/Sub_Level_Three.mp3',
+    'audio/Steel_and_Rain.mp3',
+    'audio/Terminal_Velocity.mp3'
+  ]
+};
 </script>
 </body>
 </html>

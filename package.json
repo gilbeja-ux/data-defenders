@@ -6,7 +6,7 @@
   "scripts": {
     "start": "npm run build",
     "build": "node scripts/build.js",
-    "dev": "npm run build && http-server src -c-1 -p 8000",
+    "dev": "npm run build && node scripts/serve.js",
     "ios": "ionic cap open ios",
     "android": "ionic cap open android",
     "sync": "npm run build && ionic cap sync"
