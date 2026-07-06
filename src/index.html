@@ -7,6 +7,12 @@
 <meta name="mobile-web-app-capable" content="yes">
 <title>Data Defenders</title>
 <style>
+  :root {
+    --sat: env(safe-area-inset-top, 0px);
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sal: env(safe-area-inset-left, 0px);
+    --sar: env(safe-area-inset-right, 0px);
+  }
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html, body { width:100%; height:100%; overflow:hidden; background:#03060e; touch-action:none;
     font-family:'Segoe UI', system-ui, -apple-system, sans-serif; user-select:none; -webkit-user-select:none; }
@@ -23,8 +29,13 @@
 // ============================================================
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+let ctx = canvas.getContext('2d'); // rebindable so offscreen layers can reuse the painters
 let W = 0, H = 0, DPR = 1;
+let SAFE = { t: 0, b: 0, l: 0, r: 0 }; // safe-area insets mapped into game space
+function withCanvas(cv, fn) {
+  const o = ctx; ctx = cv.getContext('2d');
+  try { fn(); } finally { ctx = o; }
+}
 
 let ROT = false; // landscape-only: on portrait screens the whole game renders rotated 90°
 function resize() {
@@ -36,7 +47,15 @@ function resize() {
   canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
   if (ROT) ctx.setTransform(0, DPR, -DPR, 0, cw * DPR, 0);
   else ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // notch / home-indicator insets, rotated with the game when in portrait
+  try {
+    const cs = getComputedStyle(document.documentElement);
+    const px = v => parseFloat(cs.getPropertyValue(v)) || 0;
+    const st = px('--sat'), sb = px('--sab'), sl = px('--sal'), sr = px('--sar');
+    SAFE = ROT ? { l: st, r: sb, t: sr, b: sl } : { t: st, b: sb, l: sl, r: sr };
+  } catch (e) { SAFE = { t: 0, b: 0, l: 0, r: 0 }; }
   buildBackground();
+  buildMenuCache();
 }
 window.addEventListener('resize', resize);
 // map screen-space pointer coords into (possibly rotated) game space
@@ -358,6 +377,7 @@ let levelIdx = 0, levelT = 0, spawnT = 0;
 let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0;
 let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
+let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
 let endWin = false, endStars = 0, endT = 0;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
 let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null;
@@ -460,9 +480,9 @@ const pointers = {}; // id -> { side, lastA }
 const isLandscape = () => W > H;
 function dialCenter(side) {
   if (isLandscape()) {
-    // corner dials, proportioned like the mock
-    const r = H * 0.21, mx = H * 0.25, my = H * 0.75;
-    return side === 'L' ? { x: mx, y: my, r } : { x: W - mx, y: my, r };
+    // corner dials, proportioned like the mock, nudged inside the safe area
+    const r = H * 0.21, mx = H * 0.25, my = H * 0.75 - SAFE.b * 0.5;
+    return side === 'L' ? { x: mx + SAFE.l, y: my, r } : { x: W - mx - SAFE.r, y: my, r };
   }
   const m = Math.min(W, H) * 0.17;
   return side === 'L' ? { x: m * 0.95, y: H - m * 0.95, r: m * 0.72 } : { x: W - m * 0.95, y: H - m * 0.95, r: m * 0.72 };
@@ -527,6 +547,16 @@ window.addEventListener('keydown', e => {
   }
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// auto-pause when the app loses the screen (phone lock, app switch, tab change)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (state === S.PLAY) state = S.PAUSE;
+    if (AC && AC.state === 'running') AC.suspend().catch(() => {});
+  } else if (AC && AC.state === 'suspended') {
+    AC.resume().catch(() => {});
+  }
+});
 
 // ---------- menu / end screens hit areas ----------
 let menuButtons = [];
@@ -729,14 +759,15 @@ function drawTunnel(g) {
 let streaks = [];
 function initStreaks() {
   streaks = [];
-  for (let i = 0; i < 190; i++) {
+  const nGold = lowFX ? 90 : 190, nAmbient = lowFX ? 50 : 110;
+  for (let i = 0; i < nGold; i++) {
     streaks.push({
       z: Math.random(),
       a: Math.PI / 2 + rand(-0.55, 0.55),          // biased to bottom
       gold: true, sp: rand(0.5, 1)
     });
   }
-  for (let i = 0; i < 110; i++) {
+  for (let i = 0; i < nAmbient; i++) {
     streaks.push({ z: Math.random(), a: Math.random() * TAU, gold: false, amber: Math.random() < 0.22, sp: rand(0.4, 0.9) });
   }
 }
@@ -796,7 +827,9 @@ function drawEnemy(en, g) {
   if (near > 0.2) {
     const ta = clamp((near - 0.2) / 0.45, 0, 1) * fade;
     ctx.lineCap = 'round';
-    for (const t of en.tendrils) {
+    const tStep = lowFX ? 2 : 1;
+    for (let ti = 0; ti < en.tendrils.length; ti += tStep) {
+      const t = en.tendrils[ti];
       const wob = Math.sin(en.spin * 1.2 + t.ph) * 0.1;
       const a0 = t.a + wob;
       const L2 = size * t.len;
@@ -1096,7 +1129,7 @@ function techPanel(x, y, w, h, title) {
   const cut = 16;
   techRect(x, y, w, h, cut);
   ctx.fillStyle = 'rgba(4,14,30,0.92)'; ctx.fill();
-  ctx.shadowColor = 'rgba(95,215,255,0.55)'; ctx.shadowBlur = 16;
+  ctx.shadowColor = 'rgba(95,215,255,0.55)'; ctx.shadowBlur = lowFX ? 0 : 16;
   ctx.strokeStyle = 'rgba(110,210,255,0.65)'; ctx.lineWidth = 1.5;
   techRect(x, y, w, h, cut); ctx.stroke();
   ctx.shadowBlur = 0;
@@ -1186,17 +1219,17 @@ function drawHUD(g) {
   // score (right)
   ctx.textAlign = 'right';
   ctx.fillStyle = '#ffd24a'; ctx.font = '700 20px system-ui';
-  ctx.fillText(score.toLocaleString(), W - pad, H * 0.12 + 8);
+  ctx.fillText(score.toLocaleString(), W - pad - SAFE.r, H * 0.12 + 8);
   ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '600 10px system-ui';
-  ctx.fillText('SCORE', W - pad, H * 0.12 + 24);
+  ctx.fillText('SCORE', W - pad - SAFE.r, H * 0.12 + 24);
   if (combo >= 3) {
     ctx.fillStyle = '#ffd24a'; ctx.font = '700 14px system-ui';
-    ctx.fillText('COMBO x' + Math.min(combo, 5), W - pad, H * 0.12 + 48);
+    ctx.fillText('COMBO x' + Math.min(combo, 5), W - pad - SAFE.r, H * 0.12 + 48);
   }
   ctx.textAlign = 'left';
 
   // pause button (top-left)
-  pauseBtnRect = { x: 12, y: 12, w: 38, h: 38 };
+  pauseBtnRect = { x: 12 + SAFE.l, y: 12 + SAFE.t, w: 38, h: 38 };
   techRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 8);
   ctx.fillStyle = 'rgba(6,20,40,0.6)'; ctx.fill();
   ctx.strokeStyle = 'rgba(120,220,255,0.55)'; ctx.lineWidth = 1.5;
@@ -1336,7 +1369,7 @@ function button(x, y, w, h, label, primary, locked) {
     ctx.strokeStyle = 'rgba(120,180,255,0.20)'; ctx.lineWidth = 1;
     techRect(x, y, w, h, cut); ctx.stroke();
   } else {
-    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = primary ? 14 : 6;
+    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = lowFX ? 0 : (primary ? 14 : 6);
     ctx.strokeStyle = primary ? 'rgba(150,238,255,0.95)' : 'rgba(95,200,255,0.55)';
     ctx.lineWidth = 1.5;
     techRect(x, y, w, h, cut); ctx.stroke();
@@ -1398,7 +1431,7 @@ function levelKey(x, y, w, h, num, name, stars, locked, primary) {
     ctx.strokeStyle = 'rgba(120,180,255,0.20)'; ctx.lineWidth = 1;
     techRect(x, y, w, h, cut); ctx.stroke();
   } else {
-    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = primary ? 14 : 6;
+    ctx.shadowColor = 'rgba(95,215,255,0.8)'; ctx.shadowBlur = lowFX ? 0 : (primary ? 14 : 6);
     ctx.strokeStyle = primary ? 'rgba(150,238,255,0.95)' : 'rgba(95,200,255,0.55)';
     ctx.lineWidth = 1.5;
     techRect(x, y, w, h, cut); ctx.stroke();
@@ -1433,11 +1466,79 @@ function levelKey(x, y, w, h, num, name, stars, locked, primary) {
   }
 }
 
-function drawMenu(g) {
-  menuButtons = [];
-  // HUD garnish around the screen edges
+// geometry shared by the static menu layer and the live level keys
+function menuGeom() {
+  const ccx = W / 2, ccy = H / 2;
+  const R = Math.min(H * 0.52, W * 0.30);
+  const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
+  const total = LEVELS.length * (bh + gap) - gap;
+  const listY = ccy - total / 2 + 8;
+  return { ccx, ccy, R, bw, bh, gap, total, listY };
+}
+// static menu furniture — repainted only on resize, blitted every frame
+function paintMenuStatic() {
+  const { ccx, ccy, R, gap, total, listY } = menuGeom();
+  // HUD garnish
   plusCluster(W - 118, 26, 'rgba(120,220,255,0.45)');
   plusCluster(W - 140, H - 40, 'rgba(120,220,255,0.25)');
+  ctx.font = '10px monospace'; ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(120,210,255,0.45)'; ctx.fillRect(W - 96, H - 54, 76, 2);
+  ctx.fillStyle = 'rgba(120,210,255,0.25)'; ctx.fillRect(W - 96, H - 49, 76, 2);
+  // block logo — stacked DATA / DEFE / NDER, top-left
+  const fs = Math.min(H * 0.125, W * 0.055);
+  const lx = 26 + SAFE.l, llh = fs * 1.04;
+  let ly = 24 + fs;
+  ctx.textAlign = 'left';
+  ctx.font = '900 ' + fs.toFixed(0) + 'px system-ui';
+  try { ctx.letterSpacing = (fs * 0.08).toFixed(1) + 'px'; } catch (e) {}
+  ctx.shadowColor = 'rgba(0,10,30,0.85)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+  ctx.fillStyle = '#c6d6ea';
+  for (const t of ['DATA', 'DEFE', 'NDER']) { ctx.fillText(t, lx, ly); ly += llh; }
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.fillStyle = 'rgba(180,215,255,0.6)'; ctx.font = '500 11px system-ui';
+  ctx.fillText('Guard the payload.', lx + 2, ly - llh + 20);
+  ctx.fillText('Zap the data traps.', lx + 2, ly - llh + 35);
+  // tunnel disc — a dark mouth in the center that makes the level keys pop
+  const dg = ctx.createRadialGradient(ccx, ccy, R * 0.2, ccx, ccy, R);
+  dg.addColorStop(0, 'rgba(2,5,12,0.78)');
+  dg.addColorStop(0.85, 'rgba(3,8,18,0.62)');
+  dg.addColorStop(1, 'rgba(4,10,22,0.55)');
+  ctx.beginPath(); ctx.arc(ccx, ccy, R, 0, TAU);
+  ctx.fillStyle = dg; ctx.fill();
+  ctx.strokeStyle = 'rgba(100,190,255,0.14)'; ctx.lineWidth = 1.5; ctx.stroke();
+  // scroll rail track on the disc's right rim (the bright thumb is drawn live)
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(12,30,55,0.9)'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, 0.42 * Math.PI); ctx.stroke();
+  // header
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f2faff'; ctx.font = '700 17px system-ui';
+  try { ctx.letterSpacing = '1px'; } catch (e) {}
+  ctx.fillText('Select a level', ccx, ccy - R + 34);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  // control hint under the list
+  ctx.fillStyle = 'rgba(180,215,255,0.5)'; ctx.font = '500 11px system-ui';
+  ctx.fillText('Left thumb = blue node · Right thumb = white node', ccx, listY + total + gap + 14);
+  ctx.textAlign = 'left';
+}
+let menuCache = null;
+function buildMenuCache() {
+  if (!W || !H) return;
+  menuCache = document.createElement('canvas');
+  menuCache.width = W * DPR; menuCache.height = H * DPR;
+  withCanvas(menuCache, () => {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    paintMenuStatic();
+  });
+}
+
+function drawMenu(g) {
+  menuButtons = [];
+  if (!menuCache) buildMenuCache();
+  if (menuCache) ctx.drawImage(menuCache, 0, 0, W, H);
+  const { ccx, ccy, R, bw, bh, gap, listY } = menuGeom();
+
   ctx.font = '10px monospace'; ctx.textAlign = 'left';
   // bottom-left: diagnostic carousel — count up fast, hold ~5s, then the next block
   // in the bar lights up white and a fresh count begins
@@ -1464,27 +1565,9 @@ function drawMenu(g) {
   ctx.fillStyle = 'rgba(120,210,255,0.5)';
   ctx.fillText(String(Math.floor(44589 + time * 12.4) % 100000).padStart(5, '0'), W - 20, H - 34);
   ctx.fillText(String(Math.floor(45895 + time * 31.7) % 100000).padStart(5, '0'), W - 20, H - 22);
-  ctx.fillStyle = 'rgba(120,210,255,0.45)'; ctx.fillRect(W - 96, H - 54, 76, 2);
-  ctx.fillStyle = 'rgba(120,210,255,0.25)'; ctx.fillRect(W - 96, H - 49, 76, 2);
-
-  // block logo — stacked DATA / DEFE / NDER, top-left
-  const fs = Math.min(H * 0.125, W * 0.055);
-  const lx = 26, llh = fs * 1.04;
-  let ly = 24 + fs;
-  ctx.textAlign = 'left';
-  ctx.font = '900 ' + fs.toFixed(0) + 'px system-ui';
-  try { ctx.letterSpacing = (fs * 0.08).toFixed(1) + 'px'; } catch (e) {}
-  ctx.shadowColor = 'rgba(0,10,30,0.85)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
-  ctx.fillStyle = '#c6d6ea';
-  for (const s of ['DATA', 'DEFE', 'NDER']) { ctx.fillText(s, lx, ly); ly += llh; }
-  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
-  try { ctx.letterSpacing = '0px'; } catch (e) {}
-  ctx.fillStyle = 'rgba(180,215,255,0.6)'; ctx.font = '500 11px system-ui';
-  ctx.fillText('Guard the payload.', lx + 2, ly - llh + 20);
-  ctx.fillText('Zap the data traps.', lx + 2, ly - llh + 35);
 
   // audio config key (top-right)
-  menuGearRect = { x: W - 50, y: 12, w: 38, h: 38 };
+  menuGearRect = { x: W - 50 - SAFE.r, y: 12 + SAFE.t, w: 38, h: 38 };
   const r = menuGearRect;
   techRect(r.x, r.y, r.w, r.h, 8);
   ctx.fillStyle = 'rgba(6,20,40,0.6)'; ctx.fill();
@@ -1493,40 +1576,21 @@ function drawMenu(g) {
   ctx.strokeStyle = 'rgba(200,240,255,0.9)'; ctx.lineWidth = 1.5;
   const knobX = [r.x + 24, r.x + 13, r.x + 27];
   for (let i = 0; i < 3; i++) {
-    const ly = r.y + 11 + i * 8;
-    ctx.beginPath(); ctx.moveTo(r.x + 8, ly); ctx.lineTo(r.x + 30, ly); ctx.stroke();
+    const gy = r.y + 11 + i * 8;
+    ctx.beginPath(); ctx.moveTo(r.x + 8, gy); ctx.lineTo(r.x + 30, gy); ctx.stroke();
     ctx.fillStyle = '#dff6ff';
-    ctx.fillRect(knobX[i] - 2.5, ly - 3.5, 5, 7);
+    ctx.fillRect(knobX[i] - 2.5, gy - 3.5, 5, 7);
   }
 
-  // tunnel disc — a dark mouth in the center that makes the level keys pop
-  const ccx = W / 2, ccy = H / 2;
-  const R = Math.min(H * 0.52, W * 0.30);
-  const dg = ctx.createRadialGradient(ccx, ccy, R * 0.2, ccx, ccy, R);
-  dg.addColorStop(0, 'rgba(2,5,12,0.78)');
-  dg.addColorStop(0.85, 'rgba(3,8,18,0.62)');
-  dg.addColorStop(1, 'rgba(4,10,22,0.55)');
-  ctx.beginPath(); ctx.arc(ccx, ccy, R, 0, TAU);
-  ctx.fillStyle = dg; ctx.fill();
-  ctx.strokeStyle = 'rgba(100,190,255,0.14)'; ctx.lineWidth = 1.5; ctx.stroke();
-  // rounded scroll rail hugging the disc's right rim
+  // scroll thumb — bright arc segment on the rail
   ctx.lineCap = 'round';
-  ctx.strokeStyle = 'rgba(12,30,55,0.9)'; ctx.lineWidth = 5;
-  ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, 0.42 * Math.PI); ctx.stroke();
   ctx.strokeStyle = '#4db6ff'; ctx.lineWidth = 7;
-  ctx.shadowColor = 'rgba(90,200,255,0.8)'; ctx.shadowBlur = 8;
+  ctx.shadowColor = 'rgba(90,200,255,0.8)'; ctx.shadowBlur = lowFX ? 0 : 8;
   ctx.beginPath(); ctx.arc(ccx, ccy, R + 9, -0.42 * Math.PI, -0.16 * Math.PI); ctx.stroke();
   ctx.shadowBlur = 0;
-  // header
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#f2faff'; ctx.font = '700 17px system-ui';
-  try { ctx.letterSpacing = '1px'; } catch (e) {}
-  ctx.fillText('Select a level', ccx, ccy - R + 34);
-  try { ctx.letterSpacing = '0px'; } catch (e) {}
+
   // level keys, centered in the disc
-  const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
-  const total = LEVELS.length * (bh + gap) - gap;
-  let by = ccy - total / 2 + 8;
+  let by = listY;
   for (let i = 0; i < LEVELS.length; i++) {
     const bx = ccx - bw / 2;
     const locked = i + 1 > progress.unlocked;
@@ -1534,10 +1598,6 @@ function drawMenu(g) {
     menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
     by += bh + gap;
   }
-  // control hint inside the disc, under the list
-  ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(180,215,255,0.5)'; ctx.font = '500 11px system-ui';
-  ctx.fillText('Left thumb = blue node · Right thumb = white node', ccx, by + 14);
   ctx.textAlign = 'left';
 
   if (menuSettings) drawMenuSettings();
@@ -1615,11 +1675,27 @@ function drawEnd(g) {
   ctx.textAlign = 'left';
 }
 
+// ---------- perf watchdog: shed visual load if the frame rate slips ----------
+function perfWatch(rawDt) {
+  if (lowFX || time < 5 || rawDt > 0.5) return; // ignore startup jank + tab-switch gaps
+  perfAcc += rawDt; perfN++; perfWin += rawDt;
+  if (perfWin >= 2) { // ~2s rolling window
+    if (perfAcc / perfN > 1 / 42) { // sustained under ~42fps → permanently shed load
+      lowFX = true;
+      initStreaks();
+      wallSnips.length = Math.min(wallSnips.length, 14);
+    }
+    perfAcc = 0; perfN = 0; perfWin = 0;
+  }
+}
+
 // ---------- main loop ----------
 let last = performance.now();
 function frame(now) {
-  const dt = Math.min((now - last) / 1000, 0.05);
+  const rawDt = (now - last) / 1000;
+  const dt = Math.min(rawDt, 0.05);
   last = now;
+  perfWatch(rawDt);
   update(dt);
 
   ctx.save();

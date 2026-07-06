@@ -25,9 +25,10 @@ global.document = {
   getElementById: () => canvasStub,
   createElement: () => ({ width: 0, height: 0, style: {}, getContext: () => ctxStub }),
   documentElement: {},
-  addEventListener() {},
+  addEventListener(k, fn) { docHandlers[k] = fn; },
   hidden: false
 };
+const docHandlers = {};
 // fake Web Audio: decoded buffer has 0.5s of "encoder padding" silence at the
 // head (500 samples @ 1kHz) and 1s at the tail, so loop-point trimming is testable
 function makeBuf() {
@@ -81,7 +82,7 @@ code = code.replace("'use strict';", '') + `
   gearRect: () => menuGearRect, toggles: () => pauseTogglesList,
   enemies: () => enemies,
   stats: () => ({ zaps, misses, score, integrity, combo }),
-  playTrack, updateMusic, settings, progress,
+  playTrack, updateMusic, settings, progress, perf: () => ({ lowFX }),
   music: () => ({ src: musicSrc, gain: musicGain, key: currentTrackKey, ac: AC })
 };`;
 eval(code);
@@ -171,6 +172,19 @@ const gr = G.gearRect();
 G.menuTap(gr.x + 10, gr.y + 10, 1);
 check('gear button opens the overlay', G.getMenuSettings() === true);
 G.setMenuSettings(false);
+
+// ================= lifecycle + perf watchdog =================
+G.setState(G.S.PLAY);
+global.document.hidden = true; docHandlers.visibilitychange();
+check('hiding the app auto-pauses gameplay', G.getState() === G.S.PAUSE);
+check('hiding the app suspends audio', G.music().ac && G.music().ac.state === 'suspended');
+global.document.hidden = false; docHandlers.visibilitychange();
+check('returning resumes the audio context', G.music().ac && G.music().ac.state === 'running');
+
+G.setState(G.S.MENU);
+G.update(6); // past the watchdog's startup grace period
+for (let i = 0; i < 80; i++) G.frame(100000 + i * 40); // sustained 25fps
+check('perf watchdog trips lowFX after sustained slow frames', G.perf().lowFX === true);
 
 // ================= Web Audio music looper =================
 const tick = () => new Promise(r => setImmediate(r));
