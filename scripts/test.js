@@ -28,10 +28,41 @@ global.document = {
   addEventListener() {},
   hidden: false
 };
+// fake Web Audio: decoded buffer has 0.5s of "encoder padding" silence at the
+// head (500 samples @ 1kHz) and 1s at the tail, so loop-point trimming is testable
+function makeBuf() {
+  const d = new Float32Array(10000);
+  for (let i = 500; i < 9000; i++) d[i] = 0.5;
+  return { sampleRate: 1000, length: 10000, duration: 10, getChannelData: () => d };
+}
+class FakeGain {
+  constructor() { this.gain = { value: 1, setValueAtTime() {}, exponentialRampToValueAtTime() {} }; }
+  connect() {} disconnect() {}
+}
+class FakeSrc {
+  constructor() { this.buffer = null; this.loop = false; this.loopStart = 0; this.loopEnd = 0; this.started = false; this.stopped = false; }
+  connect() {} disconnect() {}
+  start(t, off) { this.started = true; this.startOffset = off; }
+  stop() { this.stopped = true; }
+}
+class FakeAC {
+  constructor() { this.state = 'running'; this.destination = {}; this.currentTime = 0; }
+  createGain() { return new FakeGain(); }
+  createBufferSource() { return new FakeSrc(); }
+  createOscillator() {
+    return { type: '', frequency: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {}, start() {}, stop() {} };
+  }
+  decodeAudioData() { return Promise.resolve(makeBuf()); }
+  resume() { this.state = 'running'; return Promise.resolve(); }
+  suspend() { this.state = 'suspended'; return Promise.resolve(); }
+}
+const fetchLog = [];
+global.fetch = url => { fetchLog.push(url); return Promise.resolve({ arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }); };
 global.window = {
   innerWidth: 800, innerHeight: 450,
   devicePixelRatio: 1,
   addEventListener() {},
+  AudioContext: FakeAC,
   MUSIC_DATA: { menu: 'menu.mp3', levels: ['l1.mp3', 'l2.mp3', 'l3.mp3'] }
 };
 global.getComputedStyle = () => ({ getPropertyValue: () => '0px' });
@@ -40,14 +71,6 @@ global.navigator = {};
 global.performance = { now: () => 0 };
 global.requestAnimationFrame = () => {};
 global.screen = {};
-global.Audio = class {
-  constructor(src) {
-    this.src = src; this.paused = true; this.currentTime = 0;
-    this.duration = 10; this.volume = 1; this.muted = false; this.ended = false;
-  }
-  play() { this.paused = false; return Promise.resolve(); }
-  pause() { this.paused = true; }
-};
 
 // expose internals for the tests
 code = code.replace("'use strict';", '') + `
@@ -58,7 +81,8 @@ code = code.replace("'use strict';", '') + `
   gearRect: () => menuGearRect, toggles: () => pauseTogglesList,
   enemies: () => enemies,
   stats: () => ({ zaps, misses, score, integrity, combo }),
-  playTrack, updateMusic, loopers: () => musicEls, settings, progress
+  playTrack, updateMusic, settings, progress,
+  music: () => ({ src: musicSrc, gain: musicGain, key: currentTrackKey, ac: AC })
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -148,36 +172,37 @@ G.menuTap(gr.x + 10, gr.y + 10, 1);
 check('gear button opens the overlay', G.getMenuSettings() === true);
 G.setMenuSettings(false);
 
-// ================= seamless music looper =================
+// ================= Web Audio music looper =================
+const tick = () => new Promise(r => setImmediate(r));
 (async () => {
   G.settings.music = true; G.settings.musicVol = 0.5;
   G.playTrack('menu');
-  await new Promise(r => setImmediate(r));
-  const L = G.loopers().menu;
-  let cur = L.els[L.active], nxt = L.els[1 - L.active];
-  check('menu track playing after playTrack', !cur.paused);
-  check('unlock left the twin paused and unmuted', nxt.paused && !nxt.muted);
-  check('fade-in starts from silence', cur.volume === 0);
-  cur.currentTime = 5; G.updateMusic(1.1);
-  check('fade-in ramping', cur.volume > 0.05 && cur.volume < 0.45);
+  await tick(); // drain fetch→decode→start promise chain
+  let ms = G.music();
+  check('menu track decoded into a looping source', !!ms.src && ms.src.started && ms.src.loop === true);
+  check('loop points trim the encoder padding', Math.abs(ms.src.loopStart - 0.5) < 1e-9 && Math.abs(ms.src.loopEnd - 9.0) < 1e-9);
+  check('playback starts at the trimmed loop start', Math.abs(ms.src.startOffset - 0.5) < 1e-9);
+  check('fade-in starts from silence', ms.gain.gain.value === 0);
+  G.updateMusic(1.1);
+  check('fade-in ramping', ms.gain.gain.value > 0.05 && ms.gain.gain.value < 0.45);
   G.updateMusic(5);
-  check('mid-track: full volume, twin idle', Math.abs(cur.volume - 0.5) < 1e-9 && nxt.paused);
+  check('fade-in completes at the set volume', Math.abs(ms.gain.gain.value - 0.5) < 1e-9);
 
-  cur.currentTime = 9.1; G.updateMusic(0.016);
-  check('seam: twin started', !nxt.paused);
-  check('seam: volumes crossfading', cur.volume < 0.5 && nxt.volume > 0 && nxt.volume < 0.5);
-
-  cur.currentTime = 9.99; G.updateMusic(0.016);
-  check('handoff: active flipped to the twin', L.active === 1 && L.els[1] === nxt);
-  check('handoff: old take parked at 0, twin at full volume', cur.paused && cur.currentTime === 0 && Math.abs(nxt.volume - 0.5) < 1e-9);
-
-  nxt.currentTime = 9.97; nxt.ended = true; nxt.paused = true; cur.paused = true;
-  G.updateMusic(0.016);
-  check('ended fallback restarts the twin and flips back', L.active === 0 && !L.els[0].paused);
-
-  G.playTrack(0);
-  check('track switch stops both menu takes', L.els[0].paused && L.els[1].paused);
-  check('level track playing', !G.loopers().levels[0].els[0].paused);
+  const oldSrc = ms.src;
+  G.playTrack(1);
+  await tick();
+  ms = G.music();
+  check('track switch stops the old source', oldSrc.stopped);
+  check('new track playing on a fresh source', !!ms.src && ms.src !== oldSrc && ms.src.started);
+  check('new track fades in from silence too', ms.gain.gain.value === 0);
+  const sameSrc = ms.src;
+  G.playTrack(1);
+  await tick();
+  check('same-key replay is a no-op', G.music().src === sameSrc);
+  check('fetched the expected files', fetchLog.includes('menu.mp3') && fetchLog.includes('l2.mp3'));
+  G.settings.music = false; G.updateMusic(0.016);
+  check('music toggle silences the gain', G.music().gain.gain.value === 0);
+  G.settings.music = true;
 
   console.log(failures === 0 ? '\nALL TESTS PASSED' : '\n' + failures + ' FAILURES');
   process.exit(failures === 0 ? 0 : 1);

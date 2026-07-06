@@ -59,17 +59,19 @@ function applySettings() {
   if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
   updateMusic(); // volumes live on the takes; nudge now for instant slider feedback
 }
+function initAC() {
+  if (AC) return;
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    sfxGain = AC.createGain(); sfxGain.connect(AC.destination);
+    applySettings();
+  } catch (e) {}
+}
 function audio() {
-  if (!AC) {
-    try {
-      AC = new (window.AudioContext || window.webkitAudioContext)();
-      sfxGain = AC.createGain(); sfxGain.connect(AC.destination);
-      applySettings();
-    } catch (e) {}
-  }
-  if (AC && AC.state === 'suspended') AC.resume();
+  initAC();
+  if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
   // (re)start the right track — every audio() call originates from a user gesture
-  playTrack(state === S.PLAY || state === S.PAUSE ? levelIdx : 'menu');
+  playTrack(state === S.PLAY || state === S.PAUSE ? trackForLevel(levelIdx) : 'menu');
   return AC;
 }
 function tone(freq, dur, type, vol, slideTo, dest) {
@@ -83,110 +85,61 @@ function tone(freq, dur, type, vol, slideTo, dest) {
 }
 // ---------- soundtrack (MUSIC_DATA is injected in a script at the end of this file) ----------
 // menu: View From The Dashboard · L1: Sub Level Three · L2: Steel and Rain · L3: Terminal Velocity
-// each track gets two <audio> "takes"; near the end of one, the twin starts from 0
-// and they equal-power crossfade — a native `loop` mp3 always has an audible seam
-let musicEls = null, currentTrackKey = null, musicUnlocked = false;
+// Web Audio looper: each track is decoded to a buffer and looped sample-accurately
+// (native <audio loop> always has an audible seam on mp3). Encoder padding is
+// trimmed via loopStart/loopEnd. One decoded track is held in memory at a time.
+let musicGain = null, musicSrc = null;
+let currentTrackKey = null, musicLoadKey = null;
 let musicFade = 1; // 0→1 whenever a track starts from silence
 const musicVolume = () => settings.music ? settings.musicVol : 0;
-const XFADE = 1.8;        // seconds of overlap at the loop seam
 const MUSIC_FADEIN = 2.2; // seconds to fade a track in
-function makeLooper(src) {
-  const l = { els: [new Audio(src), new Audio(src)], active: 0 };
-  l.els.forEach(a => { a.preload = 'auto'; });
-  return l;
-}
-function ensureMusicEls() {
-  if (musicEls || !window.MUSIC_DATA) return;
-  try {
-    musicEls = { menu: makeLooper(window.MUSIC_DATA.menu), levels: window.MUSIC_DATA.levels.map(makeLooper) };
-  } catch (e) { musicEls = null; }
-}
-function currentLooper() {
-  if (!musicEls || currentTrackKey === null) return null;
-  return currentTrackKey === 'menu' ? musicEls.menu : musicEls.levels[currentTrackKey];
-}
-function stopLooper(l) {
-  for (const a of l.els) { a.pause(); try { a.currentTime = 0; } catch (e) {} }
-}
-// prime every take inside the first user gesture so later programmatic
-// crossfade play() calls aren't blocked (iOS/WebView autoplay policy)
-function unlockMusic(skipEl) {
-  if (musicUnlocked || !musicEls) return;
-  musicUnlocked = true;
-  for (const l of [musicEls.menu, ...musicEls.levels]) for (const a of l.els) {
-    if (a === skipEl || !a.paused) continue;
-    a.__unlocking = true; a.muted = true;
-    a.play().then(() => {
-      // a later playTrack may have claimed this take mid-unlock — leave it alone then
-      if (a.__unlocking) { a.pause(); try { a.currentTime = 0; } catch (e) {} }
-      a.muted = false; a.__unlocking = false;
-    }).catch(() => {
-      a.muted = false; a.__unlocking = false;
-      musicUnlocked = false; // blocked (no gesture yet) — retry on the next playTrack
-    });
+const trackForLevel = i => (LEVELS[i] && LEVELS[i].track !== undefined) ? LEVELS[i].track : i;
+const trackUrl = k => k === 'menu' ? window.MUSIC_DATA.menu : window.MUSIC_DATA.levels[k];
+function stopMusicSrc() {
+  if (musicSrc) {
+    try { musicSrc.stop(); } catch (e) {}
+    try { musicSrc.disconnect(); } catch (e) {}
   }
+  musicSrc = null;
 }
-// claim a take for real playback, cancelling any in-flight unlock on it
-function claimTake(a) {
-  a.__unlocking = false; a.muted = false;
+// find where the real signal starts/ends so the loop skips encoder padding
+function loopPoints(buf) {
+  const d = buf.getChannelData(0), thr = 0.001;
+  let s = 0, e = d.length - 1;
+  while (s < e && Math.abs(d[s]) < thr) s++;
+  while (e > s && Math.abs(d[e]) < thr) e--;
+  return { start: s / buf.sampleRate, end: (e + 1) / buf.sampleRate };
 }
 function playTrack(key) {
-  ensureMusicEls(); if (!musicEls) return;
-  if (key !== currentTrackKey) {
-    const old = currentLooper();
-    if (old) stopLooper(old);
-    currentTrackKey = key;
-  }
-  const L = currentLooper();
-  unlockMusic(L ? L.els[L.active] : null);
-  if (L) {
-    const cur = L.els[L.active];
-    // "playing" while __unlocking means it's only doing the muted unlock — still fresh
-    const fresh = cur.paused || cur.__unlocking;
-    claimTake(cur);
-    if (fresh) {
-      musicFade = 0; cur.volume = 0; // rise from silence
-      try { cur.currentTime = 0; } catch (e) {}
-      if (cur.paused) cur.play().catch(() => {});
-    }
-  }
+  if (!window.MUSIC_DATA) return;
+  initAC(); if (!AC) return;
+  if (!musicGain) { musicGain = AC.createGain(); musicGain.gain.value = 0; musicGain.connect(AC.destination); }
+  if (key === currentTrackKey && (musicSrc || musicLoadKey === key)) return;
+  currentTrackKey = key; musicLoadKey = key;
+  stopMusicSrc();
+  fetch(trackUrl(key))
+    .then(r => r.arrayBuffer())
+    .then(a => AC.decodeAudioData(a))
+    .then(buf => {
+      if (currentTrackKey !== key) return; // switched tracks while decoding
+      musicLoadKey = null;
+      const lp = loopPoints(buf);
+      musicSrc = AC.createBufferSource();
+      musicSrc.buffer = buf;
+      musicSrc.loop = true;
+      musicSrc.loopStart = lp.start; musicSrc.loopEnd = lp.end;
+      musicSrc.connect(musicGain);
+      musicFade = 0; musicGain.gain.value = 0; // rise from silence
+      musicSrc.start(0, lp.start);
+    })
+    .catch(() => { if (musicLoadKey === key) musicLoadKey = null; });
 }
-// runs every frame: drives fade-in, volumes and the crossfade at the loop seam
+// runs every frame: drives the fade-in and applies the volume setting
 function updateMusic(dt) {
   musicFade = Math.min(1, musicFade + (dt || 0) / MUSIC_FADEIN);
-  const L = currentLooper(); if (!L) return;
+  if (!musicGain) return;
   const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
-  const vol = musicVolume() * f;
-  const cur = L.els[L.active], nxt = L.els[1 - L.active];
-  if (cur.ended || (cur.paused && !nxt.paused)) { // seam passed — the twin carries on
-    cur.pause(); try { cur.currentTime = 0; } catch (e) {}
-    claimTake(nxt);
-    if (nxt.paused) nxt.play().catch(() => {});
-    nxt.volume = vol;
-    L.active = 1 - L.active;
-    return;
-  }
-  if (cur.paused || !isFinite(cur.duration) || !cur.duration) return;
-  const rem = cur.duration - cur.currentTime;
-  if (rem <= XFADE) {
-    if (nxt.paused || nxt.__unlocking) {
-      claimTake(nxt);
-      try { nxt.currentTime = 0; } catch (e) {}
-      nxt.volume = 0;
-      nxt.play().catch(() => {});
-    }
-    const t = clamp(rem / XFADE, 0, 1); // 1 at fade start → 0 at track end
-    cur.volume = vol * Math.sin(t * Math.PI / 2);
-    nxt.volume = vol * Math.cos(t * Math.PI / 2);
-    if (rem <= 0.06) {
-      cur.pause(); try { cur.currentTime = 0; } catch (e) {}
-      nxt.volume = vol;
-      L.active = 1 - L.active;
-    }
-  } else {
-    cur.volume = vol;
-    if (!nxt.paused) { nxt.pause(); try { nxt.currentTime = 0; } catch (e) {} }
-  }
+  musicGain.gain.value = musicVolume() * f;
 }
 const sfx = {
   zap()  { tone(880, 0.12, 'square', 0.10, 220); tone(1760, 0.08, 'sawtooth', 0.05, 440); },
@@ -622,7 +575,7 @@ function startLevel(i) {
   nodes[0].angle = Math.PI * 0.75;
   nodes[1].angle = Math.PI * 0.25;
   state = S.PLAY;
-  playTrack(i);
+  playTrack(trackForLevel(i));
 }
 
 function endLevel(win) {
