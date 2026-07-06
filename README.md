@@ -5,11 +5,18 @@ A mobile game for iOS and Android featuring dual-node controls in a fiber-optic 
 ## About
 
 Pilot a payload through a data tunnel by commanding two radial nodes to intercept incoming data traps. Features:
-- Dual-thumb radial dial controls
-- 3 progressive levels with increasing difficulty
-- Custom soundtrack with dynamic audio
+- Dual-thumb radial dial controls with a guided first-run tutorial
+- 8-level campaign: heavy traps, barrier lines, burst volleys, speed waves,
+  color-locked traps, and a firewall-core boss fight
+- Endless mode with time-ramped difficulty and best-score tracking
+- Power-ups riding the stream: slow-mo, wide-arc, auto-zap
+- Custom soundtrack with seamless Web Audio looping
+- Haptics, auto-pause on app switch, safe-area aware UI, perf watchdog
 - Offline-capable gameplay
 - Cross-platform (iOS & Android)
+
+Run the test suite with `npm test` (headless DOM-stubbed harness that drives
+the real game code).
 
 ## Development
 

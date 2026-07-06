@@ -23,6 +23,7 @@
   "license": "MIT",
   "devDependencies": {
     "@capacitor/core": "^6.0.0",
+    "@capacitor/haptics": "^6.0.0",
     "@capacitor/ios": "^6.0.0",
     "@capacitor/android": "^6.0.0",
     "@capacitor/cli": "^6.0.0"

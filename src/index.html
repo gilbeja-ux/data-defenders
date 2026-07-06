@@ -112,7 +112,6 @@ let currentTrackKey = null, musicLoadKey = null;
 let musicFade = 1; // 0→1 whenever a track starts from silence
 const musicVolume = () => settings.music ? settings.musicVol : 0;
 const MUSIC_FADEIN = 2.2; // seconds to fade a track in
-const trackForLevel = i => (LEVELS[i] && LEVELS[i].track !== undefined) ? LEVELS[i].track : i;
 const trackUrl = k => k === 'menu' ? window.MUSIC_DATA.menu : window.MUSIC_DATA.levels[k];
 function stopMusicSrc() {
   if (musicSrc) {
