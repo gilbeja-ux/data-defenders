@@ -306,6 +306,36 @@ G.update(1.7); G.update(1.7);
 check('tutorial completes and persists', G.tut() === null && G.progress.tutorialDone === true);
 check('spawns held during tutorial', true);
 
+// ================= soak: simulated minutes of play =================
+let simNow = 500000; // monotonic clock for frame() across soaks
+function soak(name, start, seconds) {
+  try {
+    start();
+    for (let t = 0; t < seconds; t += 0.05) {
+      const live = G.enemies().filter(e => !e.dead && !e.resolved);
+      if (live.length) { // crude autopilot
+        G.nodes[0].angle = live[0].angle;
+        G.nodes[1].angle = live[live.length - 1].angle;
+      } else if (G.boss()) {
+        G.nodes[0].angle = G.boss().angle;
+      }
+      G.update(0.05);
+      simNow += 50;
+      if ((t / 0.05 | 0) % 10 === 0) G.frame(simNow);
+      if (G.getState() !== G.S.PLAY) break;
+    }
+    check('soak: ' + name, true);
+  } catch (err) {
+    console.log('   ' + err.stack.split('\n')[0]);
+    check('soak: ' + name, false);
+  }
+}
+soak('metro exchange (bursts)', () => G.startLevel(2), 60);
+soak('quantum relay (color locks)', () => G.startLevel(5), 70);
+soak('darknet edge (waves + bursts)', () => G.startLevel(6), 80);
+soak('core firewall (boss fight)', () => G.startLevel(7), 90);
+soak('endless ramp', () => G.startEndless(), 150);
+
 // ================= Web Audio music looper =================
 const tick = () => new Promise(r => setImmediate(r));
 (async () => {
