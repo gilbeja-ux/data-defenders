@@ -41,7 +41,7 @@ class FakeGain {
   connect() {} disconnect() {}
 }
 class FakeSrc {
-  constructor() { this.buffer = null; this.loop = false; this.loopStart = 0; this.loopEnd = 0; this.started = false; this.stopped = false; }
+  constructor() { this.buffer = null; this.loop = false; this.loopStart = 0; this.loopEnd = 0; this.started = false; this.stopped = false; this.playbackRate = { value: 1 }; }
   connect() {} disconnect() {}
   start(t, off) { this.started = true; this.startOffset = off; }
   stop() { this.stopped = true; }
@@ -88,7 +88,7 @@ code = code.replace("'use strict';", '') + `
   boss: () => boss, endlessCfg, tut: () => tut, isEndless: () => endless, getLV: () => LV,
   startEndless, menuBtns: () => menuButtons, getEndWin: () => endWin,
   setLevelT: v => { levelT = v; }, setIntegrity: v => { integrity = v; }, setScore: v => { score = v; },
-  setMenuScroll: v => { menuScroll = v; }
+  setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -212,28 +212,39 @@ cross(en);
 check('color-locked trap zapped by its matching node', en.dead === true);
 
 // ================= power-ups =================
+// idle() steps the sim while pinning integrity so background misses can't end the level
+function idle(n) { for (let i = 0; i < n; i++) { G.setIntegrity(100); G.update(0.05); } }
 G.startLevel(1);
 G.fx.wide = 10;
-en = G.spawnEnemy(0.45, 'normal'); // outside normal TOL (0.314), inside widened (0.534)
+idle(30); // let the coverage arc ease out
+check('coverage arc eases out to the widened size', G.tolVis() > 1.6);
+en = G.spawnEnemy(0.45, 'normal'); // outside normal TOL (0.314), inside widened (~0.534)
 G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0;
 cross(en);
 check('wide-arc widens the hit window', en.dead === true);
 G.fx.wide = 0;
+idle(30);
+check('coverage arc eases back to normal', G.tolVis() < 1.05);
 G.fx.auto = 5;
 en = G.spawnEnemy(2.5, 'normal');
 G.nodes[0].angle = 0; G.nodes[1].angle = 0.2; // nowhere near it
 cross(en);
 check('auto-zap clears traps without coverage', en.dead === true);
 G.fx.auto = 0;
-for (let i = 0; i < 40; i++) G.update(0.05); // drain hit-stop
+idle(40); // drain hit-stop
 en = G.spawnEnemy(3.0, 'normal'); en.z = 0.9;
 G.update(0.05);
 const dzNormal = 0.9 - en.z;
 en.z = 0.9; G.fx.slow = 6;
 G.update(0.05);
 const dzSlow = 0.9 - en.z;
-G.fx.slow = 0;
 check('slow-mo halves the stream speed', dzSlow < dzNormal * 0.7 && dzSlow > 0);
+idle(30);
+check('slow-mo drags the music playback rate down', G.musicRate() < 0.8);
+G.fx.slow = 0;
+idle(40);
+check('music rate returns to real time when slow-mo ends', G.musicRate() > 0.97);
+G.setIntegrity(100);
 G.spawnPickup();
 const pk = G.pickups()[G.pickups().length - 1];
 pk.kind = 'auto'; pk.z = G.geo().hitZ; pk.angle = 1.2;

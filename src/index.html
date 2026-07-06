@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#03060e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <title>Data Defenders</title>
 <style>
   :root {
@@ -110,6 +114,7 @@ function tone(freq, dur, type, vol, slideTo, dest) {
 let musicGain = null, musicSrc = null;
 let currentTrackKey = null, musicLoadKey = null;
 let musicFade = 1; // 0→1 whenever a track starts from silence
+let musicRate = 1; // eased playback rate — slow-mo drags the track down with it
 const musicVolume = () => settings.music ? settings.musicVol : 0;
 const MUSIC_FADEIN = 2.2; // seconds to fade a track in
 const trackUrl = k => k === 'menu' ? window.MUSIC_DATA.menu : window.MUSIC_DATA.levels[k];
@@ -146,15 +151,19 @@ function playTrack(key) {
       musicSrc.buffer = buf;
       musicSrc.loop = true;
       musicSrc.loopStart = lp.start; musicSrc.loopEnd = lp.end;
+      musicSrc.playbackRate.value = musicRate;
       musicSrc.connect(musicGain);
       musicFade = 0; musicGain.gain.value = 0; // rise from silence
       musicSrc.start(0, lp.start);
     })
     .catch(() => { if (musicLoadKey === key) musicLoadKey = null; });
 }
-// runs every frame: drives the fade-in and applies the volume setting
+// runs every frame: drives the fade-in, volume, and the slow-mo tape-warp
 function updateMusic(dt) {
   musicFade = Math.min(1, musicFade + (dt || 0) / MUSIC_FADEIN);
+  const rateTarget = (state === S.PLAY && fx.slow > 0) ? 0.72 : 1;
+  musicRate += (rateTarget - musicRate) * Math.min(1, (dt || 0) * 5);
+  if (musicSrc && musicSrc.playbackRate) musicSrc.playbackRate.value = musicRate;
   if (!musicGain) return;
   const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
   musicGain.gain.value = musicVolume() * f;
@@ -177,6 +186,8 @@ const sfx = {
     tone(1760 * m, 0.08, 'sawtooth', 0.05, 440 * m);
   },
   pick() { tone(660, 0.09, 'triangle', 0.12, 880); tone(1320, 0.14, 'triangle', 0.10, 1760); },
+  slowDown() { tone(880, 0.50, 'sawtooth', 0.12, 180); tone(440, 0.65, 'triangle', 0.10, 110); },
+  speedUp()  { tone(180, 0.45, 'sawtooth', 0.11, 880); tone(110, 0.55, 'triangle', 0.09, 440); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
   win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
   fail() { [330, 262, 196].forEach((f, i) => setTimeout(() => tone(f, 0.3, 'sawtooth', 0.1), i * 180)); },
@@ -421,6 +432,7 @@ let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
 let hitStop = 0;              // brief slow-mo after a zap
+let tolVis = 1;               // eased hit-arc multiplier (wide-arc grows/shrinks smoothly)
 let bolts = [];               // lightning arcs (node → trap)
 const fx = { slow: 0, wide: 0, auto: 0 }; // power-up effect timers (seconds)
 let pickups = [], pickupT = 20;
@@ -798,9 +810,12 @@ function update(dt) {
   const L = LV;
 
   // effect timers run on real time; hit-stop and slow-mo scale the game clock
+  const wasSlow = fx.slow > 0;
   fx.slow = Math.max(0, fx.slow - dt);
   fx.wide = Math.max(0, fx.wide - dt);
   fx.auto = Math.max(0, fx.auto - dt);
+  if (wasSlow && fx.slow === 0) sfx.speedUp(); // time snaps back to real speed
+  tolVis += ((fx.wide > 0 ? 1.7 : 1) - tolVis) * Math.min(1, dt * 6);
   let sdt = dt;
   if (hitStop > 0) { hitStop = Math.max(0, hitStop - dt); sdt *= 0.12; }
   if (fx.slow > 0) sdt *= 0.55;
@@ -824,7 +839,7 @@ function update(dt) {
 
   const g = geo();
   const waveMul = L.waves ? 1 + 0.3 * Math.sin(levelT * 0.55) : 1;
-  const TOL = 0.314 * (fx.wide > 0 ? 1.7 : 1); // angular tolerance ~18°, widened by the power-up
+  const TOL = 0.314 * tolVis; // angular tolerance ~18°, eased wider by the wide-arc power-up
   const covers = (n, a) => Math.abs(angDiff(n.angle, a)) < TOL;
   const ringXY = a => ({ x: g.cx + Math.cos(a) * g.nodeR, y: g.cy + Math.sin(a) * g.nodeR });
   const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
@@ -916,7 +931,7 @@ function update(dt) {
         const { x, y } = ringXY(p.angle);
         burst(x, y, '#ffd24a', 24, 4);
         popup(x, y, PICKUPS[p.kind].label, '#ffd24a');
-        sfx.pick();
+        if (p.kind === 'slow') sfx.slowDown(); else sfx.pick();
         buzz(15);
       }
     }
@@ -1384,11 +1399,19 @@ function drawNodes(g) {
       ctx.arc(nearR.x, nearR.y, nearR.r, n.angle - dir * tl, n.angle, dir < 0);
       ctx.stroke();
     }
-    // coverage arc hint — drawn on the ring itself, where traps arrive
+    // coverage arc hint — drawn on the ring itself; grows/shrinks with wide-arc
+    const cov = 0.314 * tolVis;
+    const wideGlow = clamp((tolVis - 1) / 0.7, 0, 1);
     ctx.beginPath();
-    ctx.arc(nearR.x, nearR.y, g.nodeR, n.angle - 0.314, n.angle + 0.314);
-    ctx.strokeStyle = `rgba(${cCol},0.5)`;
-    ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.arc(nearR.x, nearR.y, g.nodeR, n.angle - cov, n.angle + cov);
+    ctx.strokeStyle = `rgba(${cCol},${(0.5 + wideGlow * 0.3).toFixed(2)})`;
+    ctx.lineWidth = 4 + wideGlow * 2.5; ctx.lineCap = 'round'; ctx.stroke();
+    if (wideGlow > 0.02) { // golden shimmer while the arc is overcharged
+      ctx.beginPath();
+      ctx.arc(nearR.x, nearR.y, g.nodeR + 5, n.angle - cov, n.angle + cov);
+      ctx.strokeStyle = `rgba(255,210,74,${(wideGlow * (0.35 + Math.sin(time * 6) * 0.15)).toFixed(2)})`;
+      ctx.lineWidth = 2; ctx.stroke();
+    }
     // glow
     const gl = ctx.createRadialGradient(x, y, 0, x, y, size * 2.6);
     gl.addColorStop(0, `rgba(${cCol},0.6)`);
