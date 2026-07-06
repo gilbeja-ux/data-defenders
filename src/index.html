@@ -2357,6 +2357,10 @@ function frame(now) {
 
 resize();
 requestAnimationFrame(frame);
+// offline capability + PWA installability (no-op on insecure origins)
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 // try to start the soundtrack right away — the Capacitor app WebView allows it;
 // desktop browsers that block autoplay simply start it on the first tap instead
 // (deferred a tick: the MUSIC_DATA manifest script below hasn't parsed yet)
