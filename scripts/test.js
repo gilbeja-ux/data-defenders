@@ -97,7 +97,7 @@ code = code.replace("'use strict';", '') + `
   getPerfects: () => perfects, getScore: () => score,
   getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
   startQualification, getInfoCard: () => infoCard, isQual: () => qual,
-  keys, setBeamDir: v => { beamDir = v; }, getHeat: () => heat, isOverheat: () => overheat
+  keys, setBeamDir: v => { beamDir = v; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -334,6 +334,13 @@ while (G.boss() && bGuard-- > 0) { aimBeam(); G.setIntegrity(100); G.update(0.05
 G.keys['ArrowUp'] = false;
 check('destroying the core wins the level', G.getState() === G.S.END && G.getEndWin() === true);
 check('campaign completion recorded', G.progress.stars[7] > 0);
+
+// ================= TEMP boss-test shortcut =================
+G.startBossTest();
+G.update(0.05);
+if (G.getState() === G.S.INFO) { G.update(0.5); canvasHandlers.pointerdown({ pointerId: 8, clientX: 5, clientY: 5, pointerType: 'touch' }); }
+G.update(0.05);
+check('BOSS TEST key drops straight into the duel', !!G.boss());
 
 // ================= endless mode =================
 G.setState(G.S.MENU);

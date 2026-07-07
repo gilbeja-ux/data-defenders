@@ -968,7 +968,7 @@ function menuTap(x, y, pid) {
   }
   for (const b of menuButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h && !b.locked) {
-      if (b.endless) startEndless(); else if (b.qual) startQualification(); else startLevel(b.level);
+      if (b.endless) startEndless(); else if (b.qual) startQualification(); else if (b.bossTest) startBossTest(); else startLevel(b.level);
       sfx.tick(); return;
     }
   }
@@ -1019,6 +1019,13 @@ function startQualification() {
   tut.lastA = [nodes[0].angle, nodes[1].angle];
   runTrack = (Math.random() * 3) | 0;
   playTrack(runTrack);
+}
+// TEMPORARY dev shortcut: jump straight into the CORE FIREWALL duel.
+// Remove this (and its menu key) before release — grep "BOSS TEST".
+function startBossTest() {
+  startLevel(LEVELS.length - 1);
+  levelT = LEVELS[LEVELS.length - 1].duration; // clock already expired — core spawns at once
+  introT = 999; introCd = 0;                   // skip the countdown
 }
 function startEndless() {
   levelIdx = -1; endless = true; qual = false; LV = endlessCfg(0); tut = null;
@@ -2655,7 +2662,7 @@ function menuGeom() {
   const ccx = W / 2, ccy = H / 2;
   const R = Math.min(H * 0.52, W * 0.30);
   const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
-  const items = LEVELS.length + 2; // + qualification and endless keys
+  const items = LEVELS.length + 3; // + qualification, endless, and the TEMP boss-test key
   const listY = ccy - R + 52;
   const contentH = items * (bh + gap) - gap;
   const viewH = H - listY - 6;
@@ -2802,7 +2809,7 @@ function drawMenu(g) {
   ctx.rect(ccx - bw / 2 - 30, listY - 4, bw + 60, viewH + 8);
   ctx.clip();
   const endlessOpen = progress.stars[LEVELS.length - 1] > 0; // clear the campaign to unlock
-  for (let i = 0; i <= LEVELS.length + 1; i++) {
+  for (let i = 0; i <= LEVELS.length + 2; i++) {
     const by = listY + i * (bh + gap) - menuScroll;
     if (by + bh < listY - 6 || by > listY + viewH + 6) continue;
     const bx = ccx - bw / 2;
@@ -2827,6 +2834,9 @@ function drawMenu(g) {
         ctx.textAlign = 'left';
       }
       menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: li, locked });
+    } else if (i === LEVELS.length + 2) { // TEMPORARY: BOSS TEST dev key
+      levelKey(bx, by, bw, bh, '⚔', 'BOSS TEST (DEV)', -1, false, false);
+      menuButtons.push({ x: bx, y: by, w: bw, h: bh, bossTest: true, locked: false });
     } else {
       levelKey(bx, by, bw, bh, '∞', 'ENDLESS STREAM', -1, !endlessOpen, endlessOpen);
       if (endlessOpen && progress.best > 0) {
