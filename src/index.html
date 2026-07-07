@@ -526,7 +526,9 @@ const fx = { slow: 0, wide: 0, auto: 0 }; // power-up effect timers (seconds)
 let pickups = [], pickupT = 20;
 let tut = null;               // tutorial controller (level 1, first run)
 let boss = null;              // firewall core (levels with boss: true)
-let heat = 0, overheat = false, beamDir = 0, beamActive = false; // ray-cannon duel state
+let heat = 0, overheat = false, beamActive = false; // ray-cannon duel state
+const beamAim = { x: 0, y: 0 }; // fire-stick vector: deflection of the beam INTO the tunnel
+const BEAM_S = 5;               // stick deflection → sideways drift per unit tunnel depth
 let burstQ = null;            // pending burst-volley spawns
 let patternQ = [];            // beat-choreographed volley schedule
 let endless = false, qual = false, LV = null, runTrack = 0; // active run config + its soundtrack
@@ -668,13 +670,15 @@ function spawnBoss() {
   enemies = []; pickups = []; burstQ = null; patternQ = []; // the lane clears for the duel
   boss = {
     hp: 100, maxHp: 100,
-    ang: Math.random() * TAU, rad: 0.35, tAng: Math.random() * TAU, tRad: 0.35,
-    x: W / 2, y: H / 2, retarget: 2,
-    spin: 0, hurtT: 0,
-    shootT: 2.4, shots: [],
+    // it FLIES inside the tunnel: cross-section polar (ang, rad) + depth z
+    ang: Math.random() * TAU, rad: 0.4, z: 0.6,
+    tAng: Math.random() * TAU, tRad: 0.4, tZ: 0.6,
+    u: 0, v: 0, sx: W / 2, sy: H / 2, sSize: 40,
+    retarget: 1.2, spin: 0, hurtT: 0,
+    shootT: 1.6, shots: [],
     mergeT: 0, mergeFrom: [nodes[0].angle, nodes[1].angle]
   };
-  heat = 0; overheat = false; beamActive = false;
+  heat = 0; overheat = false; beamActive = false; beamAim.x = 0; beamAim.y = 0;
   popup(W / 2, H * 0.30, 'FIREWALL CORE ONLINE', '#d465ff');
   shake = Math.min(shake + 0.6, 1);
   buzz([30, 40, 60]);
@@ -684,13 +688,24 @@ function updateBossFight(dt, g) {
   const b = boss;
   b.spin += dt * 2;
   b.hurtT = Math.max(0, b.hurtT - dt);
-  // wander inside the tunnel mouth — harder to hit
+  const z0 = g.hitZ;
+  // restless flight inside the tunnel — cross-section polar + depth
   b.retarget -= dt;
-  if (b.retarget <= 0) { b.retarget = rand(1.8, 3.2); b.tAng = Math.random() * TAU; b.tRad = rand(0.15, 0.6); }
-  b.ang += angDiff(b.tAng, b.ang) * Math.min(1, dt * 1.2);
-  b.rad = lerp(b.rad, b.tRad, Math.min(1, dt * 1.5));
-  b.x = g.cx + Math.cos(b.ang) * b.rad * g.nodeR;
-  b.y = g.cy + Math.sin(b.ang) * b.rad * g.nodeR + Math.sin(time * 1.7) * g.nodeR * 0.04;
+  if (b.retarget <= 0) {
+    b.retarget = rand(0.9, 1.7);
+    b.tAng = Math.random() * TAU;
+    b.tRad = rand(0.1, 0.6);
+    b.tZ = rand(z0 + 0.28, z0 + 0.55);
+  }
+  b.ang += angDiff(b.tAng, b.ang) * Math.min(1, dt * 2.2);
+  b.rad = lerp(b.rad, b.tRad, Math.min(1, dt * 2.2));
+  b.z = lerp(b.z, b.tZ, Math.min(1, dt * 1.6));
+  b.u = Math.cos(b.ang) * b.rad;
+  b.v = Math.sin(b.ang) * b.rad + Math.sin(time * 2.3) * 0.05;
+  const brg = ring(b.z, g);
+  b.sx = brg.x + b.u * brg.r;
+  b.sy = brg.y + b.v * brg.r;
+  b.sSize = Math.min(W, H) * 0.30 * brg.s;
   // fuse animation: both carriages slide together into the cannon
   if (b.mergeT < 1) {
     b.mergeT = Math.min(1, b.mergeT + dt / 0.9);
@@ -703,7 +718,7 @@ function updateBossFight(dt, g) {
       const mx = g.cx + Math.cos(nodes[0].angle) * railR0, my = g.cy + Math.sin(nodes[0].angle) * railR0;
       burst(mx, my, '#6fe3ff', 20, 5);
       burst(mx, my, '#ffffff', 20, 5);
-      beamDir = Math.atan2(b.y - my, b.x - mx);
+      beamAim.x = 0; beamAim.y = 0; // stick centered = straight down the tunnel
       sfx.go();
       buzz(30);
     }
@@ -712,13 +727,18 @@ function updateBossFight(dt, g) {
   nodes[1].angle = nodes[0].angle; // one fused carriage
   const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
   const nx = g.cx + Math.cos(nodes[0].angle) * railR, ny = g.cy + Math.sin(nodes[0].angle) * railR;
-  // ray cannon: hold to fire, watch the heat
+  const uv0x = Math.cos(nodes[0].angle), uv0y = Math.sin(nodes[0].angle);
+  // ray cannon: hold to fire, stick deflects the beam into the tunnel
   const beamOn = Object.values(pointers).some(p => p.beam) || !!keys['ArrowUp'];
-  if (keys['ArrowLeft']) beamDir -= 3.5 * dt;
-  if (keys['ArrowRight']) beamDir += 3.5 * dt;
+  if (keys['ArrowLeft'])  beamAim.x -= 2.2 * dt;
+  if (keys['ArrowRight']) beamAim.x += 2.2 * dt;
+  if (keys['w'] || keys['W']) beamAim.y -= 2.2 * dt;
+  if (keys['s'] || keys['S']) beamAim.y += 2.2 * dt;
+  const am = Math.hypot(beamAim.x, beamAim.y);
+  if (am > 0.85) { beamAim.x = beamAim.x / am * 0.85; beamAim.y = beamAim.y / am * 0.85; }
   beamActive = beamOn && !overheat;
   if (beamActive) {
-    heat = Math.min(1, heat + dt / 10); // ~10s of sustained fire
+    heat = Math.min(1, heat + dt / 5); // ~5s of sustained fire
     if (heat >= 1) { overheat = true; beamActive = false; sfx.overheatWarn(); buzz([60, 60, 60]); }
   } else if (overheat) {
     heat -= dt / 2; // ~2s forced cooldown
@@ -727,18 +747,18 @@ function updateBossFight(dt, g) {
     heat = Math.max(0, heat - dt / 2.5);
   }
   if (beamActive) {
-    const dx = Math.cos(beamDir), dy = Math.sin(beamDir);
-    const ox = b.x - nx, oy = b.y - ny;
-    const along = ox * dx + oy * dy;
-    const bR = Math.min(W, H) * 0.11;
-    if (along > 0 && Math.abs(-dy * ox + dx * oy) < bR) { // the beam is on the core
-      b.hp -= 15 * dt;
+    // does the ray cross the core at its depth?
+    const dz = b.z - z0;
+    const bu = uv0x + beamAim.x * BEAM_S * dz;
+    const bv = uv0y + beamAim.y * BEAM_S * dz;
+    if (dz > 0.05 && Math.hypot(bu - b.u, bv - b.v) < 0.24) {
+      b.hp -= 16 * dt;
       b.hurtT = 0.15;
-      if (Math.random() < 0.6) burst(b.x + rand(-10, 10), b.y + rand(-10, 10), '#d98cff', 2, 3);
+      if (Math.random() < 0.6) burst(b.sx + rand(-10, 10), b.sy + rand(-10, 10), '#d98cff', 2, 3);
       if (b.hp <= 0) {
-        burst(b.x, b.y, '#ffffff', 50, 6);
-        burst(b.x, b.y, '#d465ff', 50, 5);
-        popup(b.x, b.y, 'FIREWALL DOWN  +' + Math.round(2000 * mutMul()), '#ffd24a');
+        burst(b.sx, b.sy, '#ffffff', 50, 6);
+        burst(b.sx, b.sy, '#d465ff', 50, 5);
+        popup(b.sx, b.sy, 'FIREWALL DOWN  +' + Math.round(2000 * mutMul()), '#ffd24a');
         score += Math.round(2000 * mutMul());
         shake = 1;
         buzz([60, 40, 80]);
@@ -750,26 +770,32 @@ function updateBossFight(dt, g) {
     }
   }
   beamSound(beamActive, heat);
-  // the core returns fire at the cannon's position — move or take it
+  // bullet-hell return fire: mini orbs racing out of the tunnel at the ring
   b.shootT -= dt;
   if (b.shootT <= 0) {
-    b.shootT = rand(1.5, 2.5) * (b.hp < 35 ? 0.7 : 1); // enrages when wounded
-    const d2 = Math.hypot(nx - b.x, ny - b.y);
-    b.shots.push({ x: b.x, y: b.y, tx: nx, ty: ny, t: 0, dur: Math.max(0.35, d2 / (Math.min(W, H) * 0.55)) });
+    const enrage = b.hp < 35;
+    b.shootT = rand(0.5, 0.95) * (enrage ? 0.65 : 1);
+    const A = nodes[0].angle;
+    const fireOrb = th => b.shots.push({ u0: b.u, v0: b.v, zb: b.z, th, t: 0, dur: rand(1.0, 1.35) });
+    const roll = Math.random();
+    if (roll < 0.45) fireOrb(A + rand(-0.12, 0.12)); // aimed
+    else if (roll < 0.8) { const sp = rand(0.3, 0.45); fireOrb(A - sp); fireOrb(A); fireOrb(A + sp); } // fan
+    else { const off = rand(0.5, 0.9); fireOrb(A - off); fireOrb(A + off); fireOrb(A + rand(-0.15, 0.15)); } // pincer
     sfx.bossShot();
   }
   for (const sh of b.shots) {
     sh.t += dt;
     if (!sh.done && sh.t >= sh.dur) {
       sh.done = true;
-      if (Math.hypot(nx - sh.tx, ny - sh.ty) < Math.min(W, H) * 0.05) { // connected
-        integrity = Math.max(0, integrity - 18);
-        redFlash = 1; shake = Math.min(shake + 0.7, 1);
-        burst(nx, ny, '#ff4a5e', 24, 4);
+      const hx = g.cx + Math.cos(sh.th) * railR, hy = g.cy + Math.sin(sh.th) * railR;
+      if (Math.abs(angDiff(nodes[0].angle, sh.th)) < 0.24) { // clipped the cannon
+        integrity = Math.max(0, integrity - 9);
+        redFlash = 1; shake = Math.min(shake + 0.5, 1);
+        burst(nx, ny, '#ff4a5e', 20, 4);
         sfx.miss();
-        buzz([50, 30, 70]);
+        buzz([40, 25, 55]);
       } else {
-        burst(sh.tx, sh.ty, '#d465ff', 8, 2.5); // splash on the ring
+        burst(hx, hy, '#d465ff', 6, 2.2); // splash on the ring
       }
     }
   }
@@ -834,6 +860,14 @@ function tryLockLandscape() {
     }
   } catch (e) {}
 }
+// duel fire-stick: dial offset → beam deflection vector (capped like a real stick)
+function setStick(P) {
+  const d = dialCenter('R');
+  let sx = (P.x - d.x) / d.r, sy = (P.y - d.y) / d.r;
+  const m = Math.hypot(sx, sy);
+  if (m > 0.85) { sx = sx / m * 0.85; sy = sy / m * 0.85; }
+  beamAim.x = sx; beamAim.y = sy;
+}
 function pointerAngle(side, px, py) {
   const d = dialCenter(side);
   return Math.atan2(py - d.y, px - d.x);
@@ -867,7 +901,7 @@ canvas.addEventListener('pointerdown', e => {
   const a0 = pointerAngle(side, P.x, P.y);
   if (boss && boss.mergeT >= 1 && side === 'R') { // fire stick: aim + hold to fire
     pointers[e.pointerId] = { side, beam: true };
-    beamDir = a0;
+    setStick(P);
     canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
     return;
   }
@@ -891,7 +925,7 @@ canvas.addEventListener('pointermove', e => {
   }
   const p = pointers[e.pointerId];
   if (!p || state !== S.PLAY) return;
-  if (p.beam) { beamDir = pointerAngle('R', P.x, P.y); return; }
+  if (p.beam) { setStick(P); return; }
   const a = pointerAngle(p.side, P.x, P.y);
   const delta = angDiff(a, p.lastA);
   p.lastA = a;
@@ -1077,7 +1111,7 @@ const INFO_CARDS = {
   lock:   { title: 'COLOR LOCK', lines: ['Keyed to a single node. Only the', 'MATCHING color can break it —', 'watch the orbiting dot.'] },
   frag:   { title: 'FRIENDLY PACKET', lines: ['Green payload data. NOT a threat.', 'Do NOT zap it — let it pass', 'and collect the bonus.'] },
   pickup: { title: 'POWER-UP', lines: ['Golden relays ride the stream.', 'Catch one with any node:', 'SLOW-MO · WIDE ARC · AUTO-ZAP.'] },
-  boss:   { title: 'FIREWALL CORE', lines: ['Your nodes fuse into a RAY CANNON.', 'LEFT thumb moves it, RIGHT thumb aims —', 'hold to fire. Dodge its shots.', 'Sustained fire OVERHEATS the cannon.'] }
+  boss:   { title: 'FIREWALL CORE', lines: ['Your nodes fuse into a RAY CANNON.', 'LEFT thumb moves it. RIGHT stick aims', 'the beam INTO the tunnel — hold to fire.', 'Dodge the orbs. Watch the heat.'] }
 };
 function showCard(key) {
   infoCard = key; infoShownAt = time;
@@ -1717,30 +1751,38 @@ function drawLineBeam(en, g) {
   ctx.restore();
 }
 
-// the firewall core — a hunting mass floating in the tunnel, plus its return fire
+// the firewall core — flying deep in the tunnel, plus its bullet-hell return fire
 function drawBoss(g) {
   const b = boss;
-  // shots first (under the core)
+  // orbs first: race from the core's depth out to the ring, growing with perspective
+  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
   for (const sh of b.shots) {
     const k = clamp(sh.t / sh.dur, 0, 1);
-    const x = lerp(sh.x, sh.tx, k), y = lerp(sh.y, sh.ty, k);
-    const px2 = lerp(sh.x, sh.tx, Math.max(0, k - 0.06)), py2 = lerp(sh.y, sh.ty, Math.max(0, k - 0.06));
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = 'rgba(212,101,255,0.45)'; ctx.lineWidth = 7;
-    ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(x, y); ctx.stroke();
-    ctx.strokeStyle = 'rgba(255,220,255,0.95)'; ctx.lineWidth = 2.5;
-    ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(x, y); ctx.stroke();
+    const z = lerp(sh.zb, g.hitZ, k);
+    const rg = ring(z, g);
+    const tu = Math.cos(sh.th) * (railR / g.nodeR), tv = Math.sin(sh.th) * (railR / g.nodeR);
+    const x = rg.x + lerp(sh.u0, tu, k) * rg.r;
+    const y = rg.y + lerp(sh.v0, tv, k) * rg.r;
+    const os = Math.min(W, H) * 0.055 * rg.s;
+    const og = ctx.createRadialGradient(x, y, 0, x, y, os * 2);
+    og.addColorStop(0, 'rgba(255,220,255,0.9)');
+    og.addColorStop(0.4, 'rgba(212,101,255,0.55)');
+    og.addColorStop(1, 'rgba(212,101,255,0)');
+    ctx.fillStyle = og;
+    ctx.beginPath(); ctx.arc(x, y, os * 2, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#f3d4ff';
+    ctx.beginPath(); ctx.arc(x, y, Math.max(1.5, os * 0.55), 0, TAU); ctx.fill();
   }
-  const size = Math.min(W, H) * 0.11 * (1 + Math.sin(b.spin * 1.6) * 0.04);
+  const size = b.sSize * (1 + Math.sin(b.spin * 1.6) * 0.04);
   ctx.save();
-  ctx.translate(b.x, b.y);
+  ctx.globalAlpha = 0.72 + 0.28 * (1 - clamp(b.z, 0, 1)); // deeper = hazier
+  ctx.translate(b.sx, b.sy);
   const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 2.6);
   gl.addColorStop(0, 'rgba(210,80,255,0.5)');
   gl.addColorStop(0.5, 'rgba(255,60,90,0.16)');
   gl.addColorStop(1, 'rgba(255,60,90,0)');
   ctx.fillStyle = gl;
   ctx.beginPath(); ctx.arc(0, 0, size * 2.6, 0, TAU); ctx.fill();
-  // rotating shard collar
   ctx.rotate(b.spin * 0.5);
   for (let i = 0; i < 14; i++) {
     const a2 = i / 14 * TAU;
@@ -1753,7 +1795,6 @@ function drawBoss(g) {
     ctx.closePath(); ctx.fill();
   }
   ctx.rotate(-b.spin * 0.5);
-  // armored core, flashing white under the beam
   const flash = b.hurtT > 0 ? b.hurtT / 0.15 : 0;
   const cg2 = ctx.createRadialGradient(-size * 0.15, -size * 0.18, 0, 0, 0, size * 1.05);
   cg2.addColorStop(0, flash > 0.3 ? '#ffffff' : '#f3d4ff');
@@ -1766,19 +1807,26 @@ function drawBoss(g) {
   ctx.beginPath(); ctx.arc(0, 0, size, 0, TAU); ctx.stroke();
   ctx.restore();
 }
-// the fused ray cannon: aim barrel + beam + impact
+// the fused ray cannon: aim barrel + a true 3D beam converging into the tunnel
 function drawBeam(g) {
   const b = boss;
   if (!b || b.mergeT < 1) return;
   const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
   const nx = g.cx + Math.cos(nodes[0].angle) * railR, ny = g.cy + Math.sin(nodes[0].angle) * railR;
   const size = Math.min(W, H) * 0.038;
-  const dx = Math.cos(beamDir), dy = Math.sin(beamDir);
+  const z0 = g.hitZ;
+  const uv0x = Math.cos(nodes[0].angle), uv0y = Math.sin(nodes[0].angle);
+  const uvAt = z => {
+    const rg = ring(z, g);
+    return { x: rg.x + (uv0x + beamAim.x * BEAM_S * (z - z0)) * rg.r, y: rg.y + (uv0y + beamAim.y * BEAM_S * (z - z0)) * rg.r, s: rg.s };
+  };
   const heatCol = heat < 0.5 ? '140,225,255' : heat < 0.8 ? '255,190,90' : '255,90,70';
-  // barrel
+  // barrel tracks the beam's entry direction
+  const p1 = uvAt(z0 + 0.06);
+  const bAng = Math.atan2(p1.y - ny, p1.x - nx);
   ctx.save();
   ctx.translate(nx, ny);
-  ctx.rotate(beamDir);
+  ctx.rotate(bAng);
   ctx.fillStyle = '#0d1626';
   roundRect(0, -size * 0.24, size * 1.5, size * 0.48, 4); ctx.fill();
   ctx.strokeStyle = 'rgba(' + heatCol + ',0.9)'; ctx.lineWidth = 1.5;
@@ -1787,27 +1835,41 @@ function drawBeam(g) {
   ctx.fillRect(size * 0.25, -size * 0.12, size * 1.1 * heat, size * 0.24); // heat window
   ctx.restore();
   if (!beamActive) return;
-  // beam: stop at the core when on target, else run to the far wall
-  const ox = b.x - nx, oy = b.y - ny;
-  const along = ox * dx + oy * dy;
-  const onTarget = along > 0 && Math.abs(-dy * ox + dx * oy) < Math.min(W, H) * 0.11;
-  const len = onTarget ? along : Math.hypot(W, H);
-  const ex = nx + dx * len, ey = ny + dy * len;
+  // where does the ray stop? the core, the tunnel wall, or the deep end
+  const dzB = b.z - z0;
+  const hitCore = dzB > 0.05 &&
+    Math.hypot(uv0x + beamAim.x * BEAM_S * dzB - b.u, uv0y + beamAim.y * BEAM_S * dzB - b.v) < 0.24;
+  let zEnd = 1.0;
+  if (hitCore) zEnd = b.z;
+  else {
+    for (let z = z0 + 0.02; z < 1; z += 0.02) {
+      const m = Math.hypot(uv0x + beamAim.x * BEAM_S * (z - z0), uv0y + beamAim.y * BEAM_S * (z - z0));
+      if (m > 1.02) { zEnd = z; break; }
+    }
+  }
+  const steps = 16, pts = [];
+  for (let i = 0; i <= steps; i++) pts.push(uvAt(z0 + (zEnd - z0) * i / steps));
   const wob = Math.sin(time * 40) * 1.5;
   ctx.lineCap = 'round';
-  ctx.strokeStyle = 'rgba(' + heatCol + ',0.30)'; ctx.lineWidth = 13 + wob;
-  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
-  ctx.strokeStyle = 'rgba(' + heatCol + ',0.7)'; ctx.lineWidth = 6;
-  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
-  if (onTarget) { // impact bloom
-    const ig = ctx.createRadialGradient(ex, ey, 0, ex, ey, size * 1.6);
+  for (const [wBase, col] of [[13 + wob, 'rgba(' + heatCol + ',0.30)'], [6, 'rgba(' + heatCol + ',0.7)'], [2.2, 'rgba(255,255,255,0.95)']]) {
+    ctx.strokeStyle = col;
+    for (let i = 1; i <= steps; i++) {
+      ctx.lineWidth = Math.max(0.4, wBase * pts[i].s / pts[0].s);
+      ctx.beginPath(); ctx.moveTo(pts[i - 1].x, pts[i - 1].y); ctx.lineTo(pts[i].x, pts[i].y); ctx.stroke();
+    }
+  }
+  const tip = pts[steps];
+  if (hitCore) { // impact bloom on the core
+    const ig = ctx.createRadialGradient(b.sx, b.sy, 0, b.sx, b.sy, b.sSize * 1.5);
     ig.addColorStop(0, 'rgba(255,255,255,0.85)');
     ig.addColorStop(0.4, 'rgba(' + heatCol + ',0.5)');
     ig.addColorStop(1, 'rgba(' + heatCol + ',0)');
     ctx.fillStyle = ig;
-    ctx.beginPath(); ctx.arc(ex, ey, size * 1.6, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(b.sx, b.sy, b.sSize * 1.5, 0, TAU); ctx.fill();
+  } else if (zEnd < 0.99) { // scorch spark where the ray rakes the tunnel wall
+    ctx.fillStyle = 'rgba(' + heatCol + ',0.7)';
+    ctx.beginPath(); ctx.arc(tip.x, tip.y, Math.max(2, 7 * tip.s), 0, TAU); ctx.fill();
+    if (Math.random() < 0.4) burst(tip.x, tip.y, '#ffd9a0', 1, 2);
   }
 }
 
@@ -1950,9 +2012,9 @@ function drawDials() {
         ctx.textAlign = 'left';
       }
     }
-    // knob
-    const ka = fireStick ? beamDir : n.angle;
-    const kx = d.x + Math.cos(ka) * d.r, ky = d.y + Math.sin(ka) * d.r;
+    // knob — during the duel the right knob is the stick position itself
+    const kx = fireStick ? d.x + beamAim.x * d.r : d.x + Math.cos(n.angle) * d.r;
+    const ky = fireStick ? d.y + beamAim.y * d.r : d.y + Math.sin(n.angle) * d.r;
     const ks = d.r * 0.3;
     const gl = ctx.createRadialGradient(kx, ky, 0, kx, ky, ks * 2);
     gl.addColorStop(0, i === 0 ? 'rgba(77,141,255,0.6)' : 'rgba(255,255,255,0.55)');

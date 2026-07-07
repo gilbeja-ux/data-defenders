@@ -97,7 +97,7 @@ code = code.replace("'use strict';", '') + `
   getPerfects: () => perfects, getScore: () => score,
   getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
   startQualification, getInfoCard: () => infoCard, isQual: () => qual,
-  keys, setBeamDir: v => { beamDir = v; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
+  keys, setBeamAim: (x, y) => { beamAim.x = x; beamAim.y = y; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -287,9 +287,11 @@ for (let i = 0; i < 40 && G.boss().mergeT < 1; i++) G.update(0.05);
 check('nodes fuse into the ray cannon', G.boss().mergeT >= 1 && Math.abs(G.nodes[0].angle - G.nodes[1].angle) < 1e-6);
 function aimBeam() {
   const g2 = G.geo();
-  const railR = g2.nodeR - Math.min(800, 450) * 0.055 * 0.86;
-  const nx = g2.cx + Math.cos(G.nodes[0].angle) * railR, ny = g2.cy + Math.sin(G.nodes[0].angle) * railR;
-  G.setBeamDir(Math.atan2(G.boss().y - ny, G.boss().x - nx));
+  const b = G.boss();
+  aim(0, Math.atan2(b.v, b.u)); aim(1, G.nodes[0].angle); // swing the cannon toward it
+  const dz = b.z - g2.hitZ;
+  const u0 = Math.cos(G.nodes[0].angle), v0 = Math.sin(G.nodes[0].angle);
+  G.setBeamAim((b.u - u0) / (5 * dz), (b.v - v0) / (5 * dz)); // beam crosses the core's depth on target
 }
 G.keys['ArrowUp'] = true;
 const hp0 = G.boss().hp;
@@ -302,7 +304,7 @@ for (let i = 0; i < 220 && !G.isOverheat(); i++) {
   G.boss().hp = Math.max(G.boss().hp, 50); // keep it alive while we cook the cannon
   G.update(0.05);
 }
-check('sustained fire overheats the cannon (~10s)', G.isOverheat() === true);
+check('sustained fire overheats the cannon (~5s)', G.isOverheat() === true);
 const hpLock = G.boss().hp;
 for (let i = 0; i < 6; i++) { aimBeam(); G.update(0.05); }
 check('overheated cannon cannot fire', Math.abs(G.boss().hp - hpLock) < 1e-9);
@@ -325,7 +327,7 @@ G.update(0.05);
 B2.shootT = 99;
 const hpMe2 = G.stats().integrity;
 for (let i = 0; i < 60 && B2.shots.length; i++) G.update(0.05); // stand still
-check('standing still takes the hit', hpMe2 - G.stats().integrity >= 18);
+check('standing still takes the hit', hpMe2 - G.stats().integrity >= 9);
 // finish it
 G.keys['ArrowUp'] = true;
 G.boss().hp = 2;
@@ -574,11 +576,12 @@ function soak(name, start, seconds) {
         aim(1, live[live.length - 1].angle);
       } else if (G.boss() && G.boss().mergeT >= 1) {
         const g2 = G.geo();
-        const railR = g2.nodeR - Math.min(800, 450) * 0.055 * 0.86;
-        const nx = g2.cx + Math.cos(G.nodes[0].angle) * railR, ny = g2.cy + Math.sin(G.nodes[0].angle) * railR;
-        G.setBeamDir(Math.atan2(G.boss().y - ny, G.boss().x - nx));
+        const bb = G.boss();
+        aim(0, G.nodes[0].angle + 0.05); // keep drifting so orbs miss sometimes
+        const dz = Math.max(0.06, bb.z - g2.hitZ);
+        const u0 = Math.cos(G.nodes[0].angle), v0 = Math.sin(G.nodes[0].angle);
+        G.setBeamAim((bb.u - u0) / (5 * dz), (bb.v - v0) / (5 * dz));
         G.keys['ArrowUp'] = true;
-        aim(0, G.nodes[0].angle + 0.05); // keep drifting so shots miss sometimes
       }
       G.update(0.05);
       simNow += 50;
