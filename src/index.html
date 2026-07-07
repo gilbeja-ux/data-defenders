@@ -80,6 +80,9 @@ const settings = {
   sound: true, soundVol: 0.8, music: true, musicVol: 0.5, haptics: true,
   aimAssist: false // soft magnet toward arriving traps (accessibility; raw skill by default)
 };
+// score-chase modifiers — unlocked with the campaign, toggled on the menu
+const mutators = { oneLife: false, fast: false, noPickups: false };
+const mutMul = () => (mutators.oneLife ? 2 : 1) * (mutators.fast ? 1.5 : 1) * (mutators.noPickups ? 1.3 : 1);
 function applySettings() {
   saveState();
   if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
@@ -114,7 +117,8 @@ function tone(freq, dur, type, vol, slideTo, dest) {
 // Web Audio looper: each track is decoded to a buffer and looped sample-accurately
 // (native <audio loop> always has an audible seam on mp3). Encoder padding is
 // trimmed via loopStart/loopEnd. One decoded track is held in memory at a time.
-let musicGain = null, musicSrc = null;
+let musicGain = null, musicSrc = null, musicFilter = null;
+let musicStartAt = 0, beatPeriod = 0, musicCut = 16000;
 let currentTrackKey = null, musicLoadKey = null;
 let musicFade = 1; // 0→1 whenever a track starts from silence
 let musicRate = 1; // eased playback rate — slow-mo drags the track down with it
@@ -128,6 +132,40 @@ function stopMusicSrc() {
   }
   musicSrc = null;
 }
+// estimate the track's beat period (sec) — energy-flux autocorrelation over 60–180 BPM
+function detectBeat(buf) {
+  try {
+    const sr = buf.sampleRate, d = buf.getChannelData(0);
+    const hop = Math.floor(sr * 0.02); // 20ms energy windows over the first minute
+    const N = Math.min(d.length, sr * 60);
+    const env = [];
+    for (let i = 0; i + hop < N; i += hop) {
+      let e = 0;
+      for (let j = i; j < i + hop; j += 4) e += d[j] * d[j];
+      env.push(e);
+    }
+    const flux = env.map((e, i) => Math.max(0, e - (env[i - 1] || 0)));
+    const corr = [];
+    let best = 0;
+    for (let lag = 16; lag <= 50; lag++) { // 0.32s–1.0s per beat
+      let c = 0;
+      for (let i = 0; i + lag < flux.length; i++) c += flux[i] * flux[i + lag];
+      corr.push([lag, c]);
+      if (c > best) best = c;
+    }
+    // smallest lag near the peak — a periodic signal correlates at every multiple
+    for (const [lag, c] of corr) if (c >= best * 0.85) return lag * 0.02;
+    return 0;
+  } catch (e) { return 0; }
+}
+// snap a spawn delay so the trap ARRIVES at the ring on a beat
+function beatQuantize(delay, travel) {
+  if (!beatPeriod || !AC || !musicSrc) return delay;
+  const pos = AC.currentTime - musicStartAt;
+  const arrive = pos + delay + (travel || 0);
+  const snapped = Math.round(arrive / beatPeriod) * beatPeriod;
+  return Math.max(snapped - (travel || 0) - pos, Math.max(0.25, delay * 0.5));
+}
 // find where the real signal starts/ends so the loop skips encoder padding
 function loopPoints(buf) {
   const d = buf.getChannelData(0), thr = 0.001;
@@ -139,7 +177,12 @@ function loopPoints(buf) {
 function playTrack(key) {
   if (!window.MUSIC_DATA) return;
   initAC(); if (!AC) return;
-  if (!musicGain) { musicGain = AC.createGain(); musicGain.gain.value = 0; musicGain.connect(AC.destination); }
+  if (!musicGain) {
+    musicGain = AC.createGain(); musicGain.gain.value = 0; musicGain.connect(AC.destination);
+    musicFilter = AC.createBiquadFilter(); // "system critical" muffle at low integrity
+    musicFilter.type = 'lowpass'; musicFilter.frequency.value = 16000;
+    musicFilter.connect(musicGain);
+  }
   if (key === currentTrackKey && (musicSrc || musicLoadKey === key)) return;
   currentTrackKey = key; musicLoadKey = key;
   stopMusicSrc();
@@ -155,9 +198,11 @@ function playTrack(key) {
       musicSrc.loop = true;
       musicSrc.loopStart = lp.start; musicSrc.loopEnd = lp.end;
       musicSrc.playbackRate.value = musicRate;
-      musicSrc.connect(musicGain);
+      musicSrc.connect(musicFilter);
       musicFade = 0; musicGain.gain.value = 0; // rise from silence
       musicSrc.start(0, lp.start);
+      musicStartAt = AC.currentTime;
+      beatPeriod = detectBeat(buf); // tempo grid for spawn choreography
     })
     .catch(() => { if (musicLoadKey === key) musicLoadKey = null; });
 }
@@ -167,6 +212,12 @@ function updateMusic(dt) {
   const rateTarget = (state === S.PLAY && fx.slow > 0) ? 0.72 : 1;
   musicRate += (rateTarget - musicRate) * Math.min(1, (dt || 0) * 5);
   if (musicSrc && musicSrc.playbackRate) musicSrc.playbackRate.value = musicRate;
+  if (musicFilter) { // the payload's health bleeds into the mix
+    const open = 16000;
+    const target = state === S.PLAY ? 700 * Math.pow(open / 700, clamp(integrity, 0, 100) / 100) : open;
+    musicCut += (target - musicCut) * Math.min(1, (dt || 0) * 3);
+    musicFilter.frequency.value = musicCut;
+  }
   if (!musicGain) return;
   const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
   musicGain.gain.value = musicVolume() * f;
@@ -190,6 +241,7 @@ const sfx = {
   },
   pick() { tone(660, 0.09, 'triangle', 0.12, 880); tone(1320, 0.14, 'triangle', 0.10, 1760); },
   slowDown() { tone(880, 0.50, 'sawtooth', 0.12, 180); tone(440, 0.65, 'triangle', 0.10, 110); },
+  perfect() { tone(2093, 0.14, 'triangle', 0.13, 2637); tone(3136, 0.10, 'sine', 0.08, 3520); },
   speedUp()  { tone(180, 0.45, 'sawtooth', 0.11, 880); tone(110, 0.55, 'triangle', 0.09, 440); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
   win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
@@ -379,17 +431,17 @@ const LEVELS = [
   { name: 'LOCAL NETWORK',  duration: 40, spawnMin: 1.50, spawnMax: 2.30, speed: 0.34, doubles: 0.00, crawlers: 0.00, heavies: 0.00, lines: 0.00, colors: 0.00, track: 0 },
   { name: 'CITY GRID',      duration: 50, spawnMin: 1.05, spawnMax: 1.80, speed: 0.40, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00, colors: 0.00, track: 1,
     hint: 'NEW THREAT: heavy traps — pin them with BOTH nodes' },
-  { name: 'METRO EXCHANGE', duration: 55, spawnMin: 0.95, spawnMax: 1.70, speed: 0.43, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00, colors: 0.00, track: 2, bursts: true,
+  { name: 'METRO EXCHANGE', duration: 55, spawnMin: 0.95, spawnMax: 1.70, speed: 0.43, doubles: 0.30, crawlers: 0.00, heavies: 0.22, lines: 0.00, colors: 0.00, frags: 0.12, track: 2, bursts: true,
     hint: 'NEW THREAT: burst transmissions — traps arrive in volleys' },
-  { name: 'GLOBAL BACKBONE',duration: 60, spawnMin: 0.85, spawnMax: 1.55, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, track: 0,
+  { name: 'GLOBAL BACKBONE',duration: 60, spawnMin: 0.85, spawnMax: 1.55, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, frags: 0.13, track: 0,
     hint: 'NEW THREAT: barrier lines — one node on each end' },
-  { name: 'DEEP FIBER',     duration: 60, spawnMin: 0.80, spawnMax: 1.50, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, track: 1, waves: true,
+  { name: 'DEEP FIBER',     duration: 60, spawnMin: 0.80, spawnMax: 1.50, speed: 0.46, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.00, frags: 0.14, track: 1, waves: true,
     hint: 'NEW THREAT: speed waves — the stream surges and slows' },
-  { name: 'QUANTUM RELAY',  duration: 65, spawnMin: 0.80, spawnMax: 1.45, speed: 0.48, doubles: 0.35, crawlers: 0.30, heavies: 0.18, lines: 0.18, colors: 0.35, track: 2,
+  { name: 'QUANTUM RELAY',  duration: 65, spawnMin: 0.80, spawnMax: 1.45, speed: 0.48, doubles: 0.35, crawlers: 0.30, heavies: 0.18, lines: 0.18, colors: 0.35, frags: 0.14, track: 2,
     hint: 'NEW THREAT: color-locked traps — match the node color' },
-  { name: 'DARKNET EDGE',   duration: 70, spawnMin: 0.68, spawnMax: 1.30, speed: 0.54, doubles: 0.40, crawlers: 0.35, heavies: 0.22, lines: 0.22, colors: 0.30, track: 0, bursts: true, waves: true,
+  { name: 'DARKNET EDGE',   duration: 70, spawnMin: 0.68, spawnMax: 1.30, speed: 0.54, doubles: 0.40, crawlers: 0.35, heavies: 0.22, lines: 0.22, colors: 0.30, frags: 0.18, track: 0, bursts: true, waves: true,
     hint: 'ALL THREATS ACTIVE — maximum traffic' },
-  { name: 'CORE FIREWALL',  duration: 45, spawnMin: 0.90, spawnMax: 1.60, speed: 0.50, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.30, track: 2, boss: true,
+  { name: 'CORE FIREWALL',  duration: 45, spawnMin: 0.90, spawnMax: 1.60, speed: 0.50, doubles: 0.35, crawlers: 0.30, heavies: 0.20, lines: 0.20, colors: 0.30, frags: 0.15, track: 2, boss: true,
     hint: 'THE FIREWALL CORE AWAITS — drain it with your nodes' }
 ];
 const ramp = (a, b, x) => lerp(a, b, clamp(x, 0, 1));
@@ -405,15 +457,16 @@ function endlessCfg(t) {
     heavies: ramp(0, 0.22, (k - 0.15) / 0.85),
     lines: ramp(0, 0.22, (k - 0.3) / 0.7),
     colors: ramp(0, 0.30, (k - 0.45) / 0.55),
+    frags: ramp(0, 0.18, (k - 0.25) / 0.75),
     bursts: t > 70, waves: t > 100
   };
 }
-const progress = { unlocked: 1, stars: [0, 0, 0, 0, 0, 0, 0, 0], tutorialDone: false, best: 0 };
+const progress = { unlocked: 1, stars: [0, 0, 0, 0, 0, 0, 0, 0], bests: [0, 0, 0, 0, 0, 0, 0, 0], tutorialDone: false, best: 0 };
 
 // ---------- persistence ----------
 const STORE_KEY = 'dataDefenders.v1';
 function saveState() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify({ progress, settings })); } catch (e) {}
+  try { localStorage.setItem(STORE_KEY, JSON.stringify({ progress, settings, mutators })); } catch (e) {}
 }
 (function loadState() {
   try {
@@ -421,7 +474,10 @@ function saveState() {
     if (d) {
       if (d.progress) Object.assign(progress, d.progress);
       if (d.settings) Object.assign(settings, d.settings);
+      if (d.mutators) Object.assign(mutators, d.mutators);
       while (progress.stars.length < LEVELS.length) progress.stars.push(0); // older saves had fewer levels
+      if (!Array.isArray(progress.bests)) progress.bests = [];
+      while (progress.bests.length < LEVELS.length) progress.bests.push(0);
     }
   } catch (e) {}
 })();
@@ -430,7 +486,7 @@ function saveState() {
 const S = { MENU: 0, PLAY: 1, END: 2, PAUSE: 3 };
 let state = S.MENU;
 let levelIdx = 0, levelT = 0, spawnT = 0;
-let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0;
+let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0, perfects = 0, fragsHit = 0;
 let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
@@ -442,11 +498,12 @@ let pickups = [], pickupT = 20;
 let tut = null;               // tutorial controller (level 1, first run)
 let boss = null;              // firewall core (levels with boss: true)
 let burstQ = null;            // pending burst-volley spawns
+let patternQ = [];            // beat-choreographed volley schedule
 let endless = false, LV = null, runTrack = 0; // active run config + its soundtrack
 let menuScroll = 0, menuPtr = null; // level-list scrolling
-let endWin = false, endStars = 0, endT = 0;
+let endWin = false, endStars = 0, endT = 0, endNewBest = false;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
-let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null, menuFsRect = null;
+let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null, menuFsRect = null, menuMutRects = [];
 const pauseDrag = {};
 
 // nodes: [left(blue), right(white)]
@@ -506,8 +563,8 @@ function spawnEnemy(forcedAngle, type) {
   const en = {
     type, lock, z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
     drift: crawler ? (Math.random() < 0.5 ? 1 : -1) * rand(0.25, 0.5) : 0,
-    crawler, sizeMul: heavy ? 1.6 : 1, speedMul: heavy ? 0.82 : 1,
-    spin: Math.random() * TAU, dead: false, shards, tendrils, partner: null
+    crawler, sizeMul: type === 'frag' ? 0.8 : heavy ? 1.6 : 1, speedMul: heavy ? 0.82 : 1,
+    spin: Math.random() * TAU, dead: false, shards, tendrils: type === 'frag' ? [] : tendrils, partner: null
   };
   enemies.push(en);
   return en;
@@ -521,11 +578,34 @@ function spawnLine() {
   e1.partner = e2; e2.partner = e1;
   e1.lineLead = true; // the pair's beam and hit test are handled once, by the lead
 }
+// hand-authored volleys — arrivals land on consecutive beats (da = angle offset)
+const PATTERNS = [
+  { steps: [{ b: 0, da: 0 }, { b: 1, da: 0.55 }, { b: 2, da: -0.55 }] },                                 // fan
+  { steps: [{ b: 0, da: 0 }, { b: 1, da: 0.45 }, { b: 2, da: 0.9 }, { b: 3, da: 1.35 }] },               // sweep
+  { steps: [{ b: 0, da: 0 }, { b: 0, da: Math.PI }, { b: 2, da: 0.5 }, { b: 2, da: Math.PI + 0.5 }] },   // pincer
+  { steps: [{ b: 0, da: 0 }, { b: 1, da: -0.4 }, { b: 2, da: -0.8 }, { b: 3, da: -1.2 }] }               // stairs
+];
+const travelTime = () => (1.12 - geo().hitZ) / ((LV || LEVELS[levelIdx]).speed * (mutators.fast ? 1.35 : 1));
 function trySpawn(dt) {
   spawnT -= dt;
   if (spawnT <= 0) {
     const L = LV || LEVELS[levelIdx];
-    spawnT = rand(L.spawnMin, L.spawnMax);
+    spawnT = beatQuantize(rand(L.spawnMin, L.spawnMax), travelTime());
+    // beat-choreographed volley?
+    if (beatPeriod && musicSrc && !patternQ.length && (endless || levelIdx > 0) && Math.random() < 0.2) {
+      const pat = PATTERNS[(Math.random() * PATTERNS.length) | 0];
+      const base = Math.random() * TAU;
+      const trav = travelTime();
+      const pos = AC.currentTime - musicStartAt;
+      const first = Math.ceil((pos + trav + 0.3) / beatPeriod);
+      for (const st of pat.steps) {
+        patternQ.push({ t: (first + st.b) * beatPeriod - pos - trav, angle: base + st.da });
+      }
+      spawnT += pat.steps.length * beatPeriod * 0.8; // give the volley room
+      return;
+    }
+    // friendly payload packet — the one thing you must NOT zap
+    if (Math.random() < (L.frags || 0)) { spawnEnemy(undefined, 'frag'); return; }
     // burst transmissions: occasionally a volley of three in rapid succession
     if (L.bursts && !burstQ && Math.random() < 0.3) {
       burstQ = { left: 2, t: 0.35 };
@@ -728,6 +808,11 @@ function menuTap(x, y, pid) {
       y > menuFsRect.y - 6 && y < menuFsRect.y + menuFsRect.h + 6) {
     toggleFullscreen(); sfx.tick(); return;
   }
+  for (const r2 of menuMutRects) {
+    if (x > r2.x - 5 && x < r2.x + r2.w + 5 && y > r2.y - 5 && y < r2.y + r2.h + 5) {
+      mutators[r2.key] = !mutators[r2.key]; saveState(); sfx.tick(); return;
+    }
+  }
   if (menuGearRect && x > menuGearRect.x - 8 && x < menuGearRect.x + menuGearRect.w + 8 &&
       y > menuGearRect.y - 8 && y < menuGearRect.y + menuGearRect.h + 8) {
     menuSettings = true; sfx.tick(); return;
@@ -753,10 +838,13 @@ function endTap(x, y) {
 }
 
 function resetRun() {
+  // modifiers stay locked until the campaign is cleared
+  if (!(progress.stars[LEVELS.length - 1] > 0)) mutators.oneLife = mutators.fast = mutators.noPickups = false;
   levelT = 0; spawnT = 1.2;
-  integrity = 100; score = 0; zaps = 0; misses = 0; combo = 0;
+  integrity = mutators.oneLife ? 25 : 100;
+  score = 0; zaps = 0; misses = 0; combo = 0; perfects = 0; fragsHit = 0;
   enemies = []; particles = []; popups = []; bolts = []; pickups = [];
-  boss = null; burstQ = null; hitStop = 0;
+  boss = null; burstQ = null; patternQ = []; hitStop = 0;
   fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
   nodes[0].angle = Math.PI * 0.75;
   nodes[1].angle = Math.PI * 0.25;
@@ -786,9 +874,11 @@ function endLevel(win) {
   } else if (win) {
     progress.stars[levelIdx] = Math.max(progress.stars[levelIdx], endStars);
     progress.unlocked = Math.max(progress.unlocked, Math.min(levelIdx + 2, LEVELS.length));
+    endNewBest = score > (progress.bests[levelIdx] || 0);
+    progress.bests[levelIdx] = Math.max(progress.bests[levelIdx] || 0, score);
     saveState();
     sfx.win();
-  } else sfx.fail();
+  } else { endNewBest = false; sfx.fail(); }
   state = S.END;
 }
 
@@ -868,8 +958,12 @@ function update(dt) {
     burstQ.t -= sdt;
     if (burstQ.t <= 0) { spawnEnemy(); burstQ.left--; burstQ.t = 0.35; if (!burstQ.left) burstQ = null; }
   }
+  if (patternQ.length) { // choreographed volleys ride the real-time beat grid
+    for (const q of patternQ) q.t -= dt;
+    while (patternQ.length && patternQ[0].t <= 0) spawnEnemy(patternQ.shift().angle);
+  }
   pickupT -= sdt;
-  if (!tut && pickupT <= 0) { pickupT = rand(20, 32); spawnPickup(); }
+  if (!tut && pickupT <= 0) { pickupT = rand(20, 32); if (!mutators.noPickups) spawnPickup(); }
 
   const g = geo();
 
@@ -885,14 +979,14 @@ function update(dt) {
         const sc = da + Math.abs(z - g.hitZ) * 1.5;
         if (sc < bestScore) { bestScore = sc; best = a; }
       };
-      for (const en of enemies) if (!en.dead && !en.resolved) consider(en.angle, en.z, en.lock);
+      for (const en of enemies) if (!en.dead && !en.resolved && en.type !== 'frag') consider(en.angle, en.z, en.lock);
       for (const p of pickups) if (!p.done) consider(p.angle, p.z);
       if (boss) consider(boss.angle, g.hitZ, undefined);
       if (best !== null) nodes[i].angle += clamp(angDiff(best, nodes[i].angle), -0.6, 0.6) * 2.2 * dt;
     }
   }
 
-  const waveMul = L.waves ? 1 + 0.3 * Math.sin(levelT * 0.55) : 1;
+  const waveMul = (L.waves ? 1 + 0.3 * Math.sin(levelT * 0.55) : 1) * (mutators.fast ? 1.35 : 1);
   const TOL = 0.314 * tolVis; // angular tolerance ~18°, eased wider by the wide-arc power-up
   const covers = (n, a) => Math.abs(angDiff(n.angle, a)) < TOL;
   const ringXY = a => ({ x: g.cx + Math.cos(a) * g.nodeR, y: g.cy + Math.sin(a) * g.nodeR });
@@ -906,6 +1000,27 @@ function update(dt) {
     if (en.drift) en.angle += en.drift * sdt;
 
     if (!en.dead && !en.resolved && en.z <= g.hitZ) {
+      // friendly payload packet: touching it IS the mistake — discrimination target
+      if (en.type === 'frag') {
+        const touched = covers(nodes[0], en.angle) || covers(nodes[1], en.angle);
+        const { x: fx2, y: fy } = ringXY(en.angle);
+        if (touched) {
+          en.dead = true;
+          combo = 0; fragsHit++;
+          integrity = Math.max(0, integrity - 25);
+          burst(fx2, fy, '#7ee262', 22, 3.5);
+          popup(fx2, fy, 'FRIENDLY PACKET DESTROYED', '#ff4a5e');
+          redFlash = 1; shake = Math.min(shake + 0.6, 1);
+          sfx.miss();
+          buzz([40, 40, 60]);
+        } else {
+          en.resolved = true;
+          const bonus = Math.round(50 * mutMul());
+          score += bonus;
+          popup(fx2, fy, 'packet safe +' + bonus, '#7ee262');
+        }
+        continue;
+      }
       let hit = false;
       const boltPairs = []; // [node, targetAngle] — where the lightning jumps from/to
       if (fx.auto > 0) {
@@ -934,8 +1049,13 @@ function update(dt) {
       if (hit) {
         en.dead = true;
         combo++;
+        // precision grading: dead-center coverage doubles the take (never via auto-zap)
+        let err = 0;
+        for (const [n, a] of boltPairs) err = Math.max(err, Math.abs(angDiff(n.angle, a)));
+        const perfect = fx.auto <= 0 && boltPairs.length > 0 && err < TOL * 0.35;
+        if (perfect) perfects++;
         const base = en.type === 'heavy' ? 250 : en.type === 'line' ? 300 : en.lock !== undefined ? 150 : 100;
-        const pts = base * Math.min(combo, 5);
+        const pts = Math.round(base * (perfect ? 2 : 1) * mutMul()) * Math.min(combo, 5);
         score += pts; zaps++;
         burst(ex, ey, '#bfeaff', 26, 4);
         burst(ex, ey, '#ffffff', 14, 5);
@@ -950,9 +1070,10 @@ function update(dt) {
           spawnBolt(s0.x, s0.y, t0.x, t0.y);
         }
         hitStop = Math.min(hitStop + (en.type === 'normal' ? 0.05 : 0.09), 0.12);
-        popup(ex, ey, '+' + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), '#bfeaff');
+        popup(ex, ey, (perfect ? 'PERFECT +' : '+') + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), perfect ? '#ffe9b0' : '#bfeaff');
         shake = Math.min(shake + (en.type === 'normal' ? 0.35 : 0.5), 0.8);
         sfx.zap(combo);
+        if (perfect) sfx.perfect();
         buzz(en.type === 'normal' ? 18 : 30);
       } else {
         en.resolved = true; // slips past the ring and flies by the player
@@ -1012,15 +1133,15 @@ function update(dt) {
         const t0 = ringXY(boss.angle), s0 = nodeXY(nodes[i]);
         spawnBolt(s0.x, s0.y, t0.x, t0.y);
         burst(t0.x, t0.y, '#d98cff', 18, 4);
-        score += 150;
+        score += Math.round(150 * mutMul());
         hitStop = Math.min(hitStop + 0.04, 0.12);
         sfx.zap(4);
         buzz(20);
         if (boss.hp <= 0) {
           burst(t0.x, t0.y, '#ffffff', 40, 6);
           burst(t0.x, t0.y, '#d98cff', 40, 5);
-          popup(t0.x, t0.y, 'FIREWALL DOWN  +2000', '#ffd24a');
-          score += 2000;
+          popup(t0.x, t0.y, 'FIREWALL DOWN  +' + Math.round(2000 * mutMul()), '#ffd24a');
+          score += Math.round(2000 * mutMul());
           boss = null;
           shake = 1;
           buzz([60, 40, 80]);
@@ -1097,7 +1218,7 @@ function initStreaks() {
     streaks.push({
       z: Math.random(),
       a: Math.PI / 2 + rand(-0.55, 0.55),          // biased to bottom
-      gold: true, sp: rand(0.5, 1)
+      gold: true, sp: rand(0.5, 1), ord: i / nGold // draw order — the river thins with integrity
     });
   }
   for (let i = 0; i < nAmbient; i++) {
@@ -1106,9 +1227,12 @@ function initStreaks() {
 }
 initStreaks();
 function drawStreaks(g, dt) {
+  // a wounded payload is a thinner, dimmer river
+  const riverK = state === S.PLAY ? 0.35 + 0.65 * clamp(integrity / 100, 0, 1) : 1;
   for (const st of streaks) {
     st.z -= dt * (state === S.PLAY ? 0.9 : 0.4) * st.sp;
     if (st.z <= -0.08) { st.z = 1; if (st.gold) st.a = Math.PI / 2 + rand(-0.55, 0.55); }
+    if (st.gold && st.ord > riverK) continue;
     const r1 = ring(st.z, g), r2 = ring(Math.min(st.z + (st.gold ? 0.05 : 0.09), 1), g);
     const rr1 = st.gold ? r1.r * rand(0.86, 0.99) : r1.r * 0.97;
     const x1 = r1.x + Math.cos(st.a) * rr1, y1 = r1.y + Math.sin(st.a) * rr1;
@@ -1139,7 +1263,11 @@ function drawEnemy(en, g) {
   if (fade <= 0.005) return;
   if (en.resolved) size *= 1 + (1 - clamp(en.z / g.hitZ, 0, 1)) * 1.6;
   // iridescent palettes — like the sprite: rich, varied facets, tinted hostile red/orange
-  const PAL = en.type === 'heavy'
+  const PAL = en.type === 'frag'
+    ? { glow: '110,230,120', tendril: '#1c5a2a', tendrilHi: '#a0f0b0',
+        shades: ['#57c95f', '#2f9e46', '#8fe08a', '#1f7a35', '#6fdc74'],
+        lights: ['#c8f7c0', '#e8ffe2', '#a0f0b0'] }
+    : en.type === 'heavy'
     ? { glow: '200,70,255', tendril: '#4a1060', tendrilHi: '#d98cff',
         shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'],
         lights: ['#eab8ff', '#f3d4ff', '#d98cff'] }
@@ -1233,8 +1361,8 @@ function drawEnemy(en, g) {
   // molten amber core burning through the facets
   const cg = ctx.createRadialGradient(-size * 0.12, -size * 0.14, 0, 0, 0, size * 0.48);
   cg.addColorStop(0, '#ffffff');
-  cg.addColorStop(0.3, en.type === 'heavy' ? '#e08cff' : en.lock === 0 ? '#7db2ff' : en.lock === 1 ? '#ffffff' : '#ffd24a');
-  cg.addColorStop(0.7, en.type === 'heavy' ? '#b03ae8' : en.lock === 0 ? '#2f7fe0' : en.lock === 1 ? '#c8d6e6' : en.crawler ? '#ff8c2a' : '#ff5a3c');
+  cg.addColorStop(0.3, en.type === 'frag' ? '#c8f7c0' : en.type === 'heavy' ? '#e08cff' : en.lock === 0 ? '#7db2ff' : en.lock === 1 ? '#ffffff' : '#ffd24a');
+  cg.addColorStop(0.7, en.type === 'frag' ? '#57c95f' : en.type === 'heavy' ? '#b03ae8' : en.lock === 0 ? '#2f7fe0' : en.lock === 1 ? '#c8d6e6' : en.crawler ? '#ff8c2a' : '#ff5a3c');
   cg.addColorStop(1, 'rgba(255,90,60,0)');
   ctx.fillStyle = cg;
   ctx.beginPath(); ctx.arc(0, 0, size * 0.48 * pulse, 0, TAU); ctx.fill();
@@ -1554,7 +1682,9 @@ function drawDials() {
         ctx.strokeStyle = `rgba(255,80,110,${al * 0.6})`; ctx.lineWidth = 1.5;
         ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(p2.x, p2.y); ctx.stroke();
       }
-      ctx.fillStyle = en.type === 'heavy'
+      ctx.fillStyle = en.type === 'frag'
+        ? `rgba(110,230,120,${al})`
+        : en.type === 'heavy'
         ? `rgba(200,80,255,${al})`
         : en.lock === 0
         ? `rgba(80,170,255,${al})`
@@ -1729,6 +1859,11 @@ function drawHUD(g) {
   if (combo >= 3) {
     ctx.fillStyle = '#ffd24a'; ctx.font = '700 14px system-ui';
     ctx.fillText('COMBO x' + Math.min(combo, 5), W - pad - SAFE.r, H * 0.12 + 48);
+  }
+  const mm = mutMul();
+  if (mm > 1) {
+    ctx.fillStyle = 'rgba(255,210,74,0.85)'; ctx.font = '700 11px system-ui';
+    ctx.fillText('MODIFIERS ×' + (Math.round(mm * 100) / 100), W - pad - SAFE.r, H * 0.12 + 66);
   }
   ctx.textAlign = 'left';
 
@@ -2199,6 +2334,11 @@ function drawMenu(g) {
     if (i < LEVELS.length) {
       const locked = i + 1 > progress.unlocked;
       levelKey(bx, by, bw, bh, i + 1, LEVELS[i].name, progress.stars[i], locked, i + 1 === progress.unlocked);
+      if (!locked && (progress.bests[i] || 0) > 0) {
+        ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(255,210,74,0.75)'; ctx.font = '700 9px system-ui';
+        ctx.fillText('BEST ' + progress.bests[i].toLocaleString(), bx + bw - 14, by + bh - 5);
+        ctx.textAlign = 'left';
+      }
       menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
     } else {
       levelKey(bx, by, bw, bh, '∞', 'ENDLESS STREAM', -1, !endlessOpen, endlessOpen);
@@ -2212,6 +2352,42 @@ function drawMenu(g) {
   }
   ctx.restore();
   ctx.textAlign = 'left';
+
+  // score modifiers — the campaign reward for players chasing numbers
+  menuMutRects = [];
+  if (progress.stars[LEVELS.length - 1] > 0) {
+    const MUTS = [['oneLife', '1 LIFE', '×2'], ['fast', 'FAST STREAM', '×1.5'], ['noPickups', 'NO PICKUPS', '×1.3']];
+    let my2 = H * 0.56;
+    ctx.font = '700 10px system-ui';
+    ctx.fillStyle = 'rgba(120,210,255,0.75)';
+    try { ctx.letterSpacing = '2px'; } catch (e) {}
+    ctx.fillText('MODIFIERS', 26 + SAFE.l, my2 - 10);
+    try { ctx.letterSpacing = '0px'; } catch (e) {}
+    for (const [key, label, mult] of MUTS) {
+      const r2 = { x: 26 + SAFE.l, y: my2, w: 128, h: 24, key };
+      const on = mutators[key];
+      techRect(r2.x, r2.y, r2.w, r2.h, 6);
+      ctx.fillStyle = on ? 'rgba(120,80,10,0.55)' : 'rgba(6,20,40,0.55)';
+      ctx.fill();
+      ctx.strokeStyle = on ? 'rgba(255,210,74,0.9)' : 'rgba(120,180,255,0.35)';
+      ctx.lineWidth = 1.5;
+      techRect(r2.x, r2.y, r2.w, r2.h, 6); ctx.stroke();
+      ctx.fillStyle = on ? '#ffe9b0' : 'rgba(160,200,240,0.7)';
+      ctx.font = '700 10px system-ui';
+      ctx.fillText(label, r2.x + 10, r2.y + 16);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = on ? '#ffd24a' : 'rgba(160,200,240,0.5)';
+      ctx.fillText(mult, r2.x + r2.w - 8, r2.y + 16);
+      ctx.textAlign = 'left';
+      menuMutRects.push(r2);
+      my2 += 30;
+    }
+    const mm2 = mutMul();
+    if (mm2 > 1) {
+      ctx.fillStyle = '#ffd24a'; ctx.font = '700 11px system-ui';
+      ctx.fillText('SCORE ×' + (Math.round(mm2 * 100) / 100), 26 + SAFE.l, my2 + 12);
+    }
+  }
 
   if (menuSettings) drawMenuSettings();
 }
@@ -2267,11 +2443,15 @@ function drawEnd(g) {
   ctx.fillText('SCORE', W / 2, H * 0.47 + 20);
   try { ctx.letterSpacing = '0px'; } catch (e) {}
   ctx.fillStyle = 'rgba(140,210,255,0.65)'; ctx.font = '11px monospace';
-  ctx.fillText('zapped: ' + zaps + '   //   missed: ' + misses + '   //   integrity: ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
+  ctx.fillText('zapped: ' + zaps + '   //   perfect: ' + perfects + '   //   missed: ' + misses + '   //   integrity: ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
   if (endless) {
     ctx.fillStyle = score >= (progress.best || 0) && score > 0 ? '#ffd24a' : 'rgba(255,210,74,0.7)';
     ctx.font = '700 13px system-ui';
     ctx.fillText((score >= (progress.best || 0) && score > 0 ? 'NEW BEST  ' : 'BEST  ') + (progress.best || 0).toLocaleString(), W / 2, H * 0.47 + 68);
+  } else if (endWin || (progress.bests[levelIdx] || 0) > 0) {
+    ctx.fillStyle = endNewBest ? '#ffd24a' : 'rgba(255,210,74,0.7)';
+    ctx.font = '700 13px system-ui';
+    ctx.fillText((endNewBest ? 'NEW BEST  ' : 'BEST  ') + (progress.bests[levelIdx] || 0).toLocaleString(), W / 2, H * 0.47 + 68);
   }
   if (isLandscape()) {
     const bw = Math.min(W * 0.24, 210), gap = 16;
@@ -2407,6 +2587,27 @@ function frame(now) {
   else if (state === S.PAUSE) { drawHUD(g); drawDials(); drawPause(); }
   else if (state === S.MENU) drawMenu(g);
   else drawEnd(g);
+
+  // system-critical glitches — the screen itself degrades with the payload
+  if (state === S.PLAY && integrity <= 50) {
+    const gi = (50 - integrity) / 50;
+    if (Math.random() < 0.15 + gi * 0.35) {
+      for (let i = 0; i < 1 + gi * 3; i++) {
+        const gy = Math.random() * H, gh = rand(2, 6 + gi * 10);
+        ctx.fillStyle = 'rgba(90,220,255,' + (0.04 + gi * 0.07).toFixed(2) + ')';
+        ctx.fillRect(0, gy, W, gh);
+        ctx.fillStyle = 'rgba(255,60,80,' + (0.03 + gi * 0.06).toFixed(2) + ')';
+        ctx.fillRect(rand(-30, 30), gy + gh, W, 2);
+      }
+    }
+    if (integrity <= 25) { // heartbeat vignette on the last block
+      const pulse = (Math.sin(time * 5) * 0.5 + 0.5) * 0.22;
+      const hv = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.72);
+      hv.addColorStop(0, 'rgba(255,40,60,0)');
+      hv.addColorStop(1, 'rgba(255,40,60,' + pulse.toFixed(2) + ')');
+      ctx.fillStyle = hv; ctx.fillRect(0, 0, W, H);
+    }
+  }
 
   // red damage vignette
   if (redFlash > 0) {

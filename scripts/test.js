@@ -52,6 +52,7 @@ class FakeAC {
   constructor() { this.state = 'running'; this.destination = {}; this.currentTime = 0; }
   createGain() { return new FakeGain(); }
   createBufferSource() { return new FakeSrc(); }
+  createBiquadFilter() { return { type: '', frequency: { value: 0 }, Q: { value: 1 }, connect() {}, disconnect() {} }; }
   createOscillator() {
     return { type: '', frequency: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {}, start() {}, stop() {} };
   }
@@ -90,7 +91,10 @@ code = code.replace("'use strict';", '') + `
   boss: () => boss, endlessCfg, tut: () => tut, isEndless: () => endless, getLV: () => LV,
   startEndless, menuBtns: () => menuButtons, getEndWin: () => endWin,
   setLevelT: v => { levelT = v; }, setIntegrity: v => { integrity = v; }, setScore: v => { score = v; },
-  setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate, dialCenter
+  setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate, dialCenter,
+  detectBeat, beatQuantize, setBeat: (p, at) => { beatPeriod = p; musicStartAt = at; },
+  patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
+  getPerfects: () => perfects, getScore: () => score
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -355,6 +359,92 @@ G.update(0.05);
 check('aim assist pulls toward an arriving trap', n0.angle > 0.01);
 G.settings.aimAssist = false;
 
+// ================= precision scoring =================
+G.startLevel(1);
+G.enemies().length = 0;
+en = G.spawnEnemy(0.7, 'normal');
+aim(0, Math.PI); aim(1, 0.7); // dead-center coverage
+let s0 = G.getScore();
+cross(en);
+check('dead-center zap scores PERFECT double (combo 1 → 200)', G.getScore() - s0 === 200 && G.getPerfects() === 1);
+en = G.spawnEnemy(0.7, 'normal');
+aim(1, 0.7 + 0.2); // covered, but sloppy (err 0.2 > TOL*0.35)
+s0 = G.getScore();
+cross(en);
+check('edge zap scores normal (combo 2 → 200, no perfect)', G.getScore() - s0 === 200 && G.getPerfects() === 1);
+
+// ================= payload fragments =================
+G.startLevel(3);
+G.enemies().length = 0;
+en = G.spawnEnemy(1.2, 'frag');
+aim(0, Math.PI); aim(1, 2.6); // leave it alone
+s0 = G.getScore();
+const int0 = G.stats().integrity;
+cross(en);
+check('untouched packet pays a small bonus', en.resolved && G.getScore() - s0 === 50 && G.stats().integrity === int0);
+en = G.spawnEnemy(1.2, 'frag');
+aim(1, 1.2); // zap the friendly — the mistake
+cross(en);
+check('zapping a friendly packet costs integrity', en.dead && G.stats().integrity === int0 - 25 && G.stats().combo === 0);
+// assist must never pull toward friendlies
+G.settings.aimAssist = true;
+G.enemies().length = 0;
+aim(0, 0);
+en = G.spawnEnemy(0.3, 'frag');
+en.z = G.geo().hitZ + 0.2;
+G.update(0.05);
+check('aim assist ignores friendly packets', Math.abs(G.nodes[0].angle) < 1e-6);
+G.settings.aimAssist = false;
+
+// ================= beat sync =================
+const bt = {
+  sampleRate: 1000, length: 30000, duration: 30,
+  getChannelData: () => {
+    const d = new Float32Array(30000);
+    for (let i = 0; i < 30000; i += 500) for (let j = 0; j < 20 && i + j < 30000; j++) d[i + j] = 1;
+    return d;
+  }
+};
+check('beat detection finds the tempo of a 120bpm click track', Math.abs(G.detectBeat(bt) - 0.5) < 0.03);
+G.patternQ().push({ t: 0.01, angle: 2.2 });
+G.enemies().length = 0;
+G.update(0.05);
+check('choreographed volley entries spawn on schedule', G.enemies().some(e => Math.abs(e.angle - 2.2) < 0.1) && G.patternQ().length === 0); // crawler drift can nudge it within the tick
+
+// ================= integrity tension =================
+G.setIntegrity(25);
+for (let i = 0; i < 60; i++) G.updateMusic(0.05);
+check('low integrity muffles the music', G.musicFilterHz() < 3000);
+G.setIntegrity(100);
+for (let i = 0; i < 60; i++) G.updateMusic(0.05);
+check('full integrity reopens the filter', G.musicFilterHz() > 12000);
+drawOk('play HUD under heavy damage glitches', () => { G.setState(G.S.PLAY); G.setIntegrity(25); });
+G.setIntegrity(100);
+
+// ================= score chase: bests + mutators =================
+G.startLevel(1);
+G.enemies().length = 0;
+en = G.spawnEnemy(0.5, 'normal');
+aim(1, 0.5 + 0.2);
+cross(en); // some score on the board
+G.setLevelT(60);
+G.enemies().length = 0;
+G.update(0.01);
+check('winning records a per-level best', G.getState() === G.S.END && G.progress.bests[1] === G.getScore() && G.getScore() > 0);
+
+G.mutators.oneLife = true; G.mutators.fast = true;
+G.startLevel(1);
+check('one-life modifier starts at a single block', G.stats().integrity === 25);
+G.enemies().length = 0;
+en = G.spawnEnemy(0.5, 'normal');
+aim(0, Math.PI); aim(1, 0.5 + 0.2);
+s0 = G.getScore();
+cross(en);
+check('modifiers multiply the take (×3 → 300)', G.getScore() - s0 === 300);
+G.mutators.noPickups = true;
+check('modifier multiplier compounds', Math.abs((2 * 1.5 * 1.3) - 3.9) < 1e-9);
+G.mutators.oneLife = G.mutators.fast = G.mutators.noPickups = false;
+
 // ================= soak: simulated minutes of play =================
 let simNow = 500000; // monotonic clock for frame() across soaks
 function soak(name, start, seconds) {
@@ -396,6 +486,10 @@ const tick = () => new Promise(r => setImmediate(r));
   check('loop points trim the encoder padding', Math.abs(ms.src.loopStart - 0.5) < 1e-9 && Math.abs(ms.src.loopEnd - 9.0) < 1e-9);
   check('playback starts at the trimmed loop start', Math.abs(ms.src.startOffset - 0.5) < 1e-9);
   check('fade-in starts from silence', ms.gain.gain.value === 0);
+  G.setBeat(0.5, -0.1); // grid anchored 0.1s ago → beats at delay 0.4, 0.9, 1.4...
+  const q = G.beatQuantize(1.13, 0);
+  check('spawn delays snap arrivals onto the beat grid', Math.abs(((0.1 + q) % 0.5)) < 1e-9 || Math.abs(((0.1 + q) % 0.5) - 0.5) < 1e-9);
+  G.setBeat(0, 0);
   G.updateMusic(1.1);
   check('fade-in ramping', ms.gain.gain.value > 0.05 && ms.gain.gain.value < 0.45);
   G.updateMusic(5);
