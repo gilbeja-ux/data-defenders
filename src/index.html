@@ -76,7 +76,15 @@ const rand = (a, b) => a + Math.random() * (b - a);
 
 // ---------- audio ----------
 let AC = null, sfxGain = null;
-const settings = { sound: true, soundVol: 0.8, music: true, musicVol: 0.5, haptics: true };
+const settings = {
+  sound: true, soundVol: 0.8, music: true, musicVol: 0.5, haptics: true,
+  // control scheme (pause menu): input pipeline stages
+  steadyGrip: true,   // scale deltas by lever arm — kills near-dial-center jitter
+  smoothing: true,    // 1€ filter — steady holds, zero-feel lag on fast swipes
+  fineAim: false,     // damp micro-deltas for precision holds
+  aimAssist: false,   // soft magnet toward arriving traps
+  rateMode: false     // joystick: hold-offset = rotation speed (replaces 1:1 drag)
+};
 function applySettings() {
   saveState();
   if (sfxGain) sfxGain.gain.value = settings.sound ? settings.soundVol : 0;
@@ -446,11 +454,23 @@ let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogg
 let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null, menuFsRect = null;
 const pauseDrag = {};
 
-// nodes: [left(blue), right(white)]
+// nodes: [left(blue), right(white)] — 'raw' is the unfiltered input angle;
+// 'angle' (rendered + gameplay) is the control pipeline's output
 const nodes = [
-  { angle: Math.PI, color: '#1c3f8f', glow: '#4d8dff' },
-  { angle: 0,       color: '#ffffff', glow: '#bfe0ff' }
+  { angle: Math.PI, raw: Math.PI, dxHat: 0, color: '#1c3f8f', glow: '#4d8dff' },
+  { angle: 0,       raw: 0,       dxHat: 0, color: '#ffffff', glow: '#bfe0ff' }
 ];
+// 1€ filter: adaptive low-pass — heavy smoothing at rest, none during fast swipes
+function filterNode(n, dt) {
+  if (dt <= 0) return;
+  if (!settings.smoothing) { n.angle = n.raw; n.prevRaw = n.raw; n.dxHat = 0; return; }
+  const MIN_CUT = 1.2, BETA = 0.9, D_CUT = 1.0;
+  const alpha = c => 1 / (1 + 1 / (TAU * c * dt));
+  const dx = (n.raw - (n.prevRaw === undefined ? n.raw : n.prevRaw)) / dt;
+  n.dxHat = lerp(n.dxHat || 0, dx, alpha(D_CUT));
+  n.angle = lerp(n.angle, n.raw, alpha(MIN_CUT + BETA * Math.abs(n.dxHat)));
+  n.prevRaw = n.raw;
+}
 
 // ---------- geometry ----------
 function geo() {
@@ -641,7 +661,8 @@ canvas.addEventListener('pointerdown', e => {
   }
   const side = P.x < W / 2 ? 'L' : 'R';
   // relative control: touching does NOT snap the node — record the start angle
-  pointers[e.pointerId] = { side, lastA: pointerAngle(side, P.x, P.y) };
+  const a0 = pointerAngle(side, P.x, P.y);
+  pointers[e.pointerId] = { side, lastA: a0, a0, curA: a0 };
   canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove', e => {
@@ -661,9 +682,20 @@ canvas.addEventListener('pointermove', e => {
   const p = pointers[e.pointerId];
   if (!p || state !== S.PLAY) return;
   const a = pointerAngle(p.side, P.x, P.y);
-  const delta = angDiff(a, p.lastA);
+  p.curA = a; // rate mode reads the live offset from the grab angle in update()
+  if (settings.rateMode) { p.lastA = a; return; }
+  let delta = angDiff(a, p.lastA);
   p.lastA = a;
-  nodes[p.side === 'L' ? 0 : 1].angle += delta; // 1:1, zero-lag: node mirrors the thumb exactly
+  // steady grip: a wobble near the dial's center is noise, not a swipe —
+  // scale by lever arm (full strength at the rim, dead at the center)
+  if (settings.steadyGrip) {
+    const d = dialCenter(p.side);
+    const rr = Math.hypot(P.x - d.x, P.y - d.y);
+    delta *= clamp((rr - d.r * 0.15) / (d.r * 0.5), 0, 1);
+  }
+  // fine aim: damp micro-deltas for precision, keep real swipes 1:1
+  if (settings.fineAim) delta *= lerp(0.35, 1, clamp(Math.abs(delta) / 0.05, 0, 1));
+  nodes[p.side === 'L' ? 0 : 1].raw += delta; // smoothing filter chases this in update()
 });
 function releasePointer(e) { delete pointers[e.pointerId]; delete pauseDrag[e.pointerId]; }
 canvas.addEventListener('pointerup', e => {
@@ -755,8 +787,9 @@ function resetRun() {
   enemies = []; particles = []; popups = []; bolts = []; pickups = [];
   boss = null; burstQ = null; hitStop = 0;
   fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
-  nodes[0].angle = Math.PI * 0.75;
-  nodes[1].angle = Math.PI * 0.25;
+  nodes[0].angle = nodes[0].raw = Math.PI * 0.75;
+  nodes[1].angle = nodes[1].raw = Math.PI * 0.25;
+  for (const n of nodes) { n.prevRaw = undefined; n.dxHat = 0; }
   state = S.PLAY;
 }
 function startLevel(i) {
@@ -854,10 +887,10 @@ function update(dt) {
 
   // keyboard control (desktop testing) — controls always run at full speed
   const kSpd = 4.5 * dt;
-  if (keys['a'] || keys['A']) nodes[0].angle -= kSpd;
-  if (keys['d'] || keys['D']) nodes[0].angle += kSpd;
-  if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
-  if (keys['ArrowRight']) nodes[1].angle += kSpd;
+  if (keys['a'] || keys['A']) nodes[0].raw -= kSpd;
+  if (keys['d'] || keys['D']) nodes[0].raw += kSpd;
+  if (keys['ArrowLeft'])  nodes[1].raw -= kSpd;
+  if (keys['ArrowRight']) nodes[1].raw += kSpd;
 
   if (tut) updateTutorial(sdt);
   else if (levelT < L.duration) trySpawn(sdt); // stop spawning once the run distance is covered
@@ -869,6 +902,34 @@ function update(dt) {
   if (!tut && pickupT <= 0) { pickupT = rand(20, 32); spawnPickup(); }
 
   const g = geo();
+
+  // ---- control pipeline (real-time dt — never slowed by hit-stop/slow-mo) ----
+  if (settings.rateMode) { // joystick: hold-offset from the grab angle = spin speed
+    for (const id in pointers) {
+      const p = pointers[id];
+      if (p.curA === undefined) continue;
+      nodes[p.side === 'L' ? 0 : 1].raw += clamp(angDiff(p.curA, p.a0) * 3.2, -6, 6) * dt;
+    }
+  }
+  if (settings.aimAssist) { // soft magnet toward whatever is about to arrive
+    for (let i = 0; i < 2; i++) {
+      let best = null, bestScore = 1e9;
+      const consider = (a, z, lock) => {
+        if (lock !== undefined && lock !== i) return; // color locks only attract their node
+        if (z > g.hitZ + 0.45 || z < g.hitZ * 0.5) return;
+        const da = Math.abs(angDiff(a, nodes[i].raw));
+        if (da > 0.5) return;
+        const sc = da + Math.abs(z - g.hitZ) * 1.5;
+        if (sc < bestScore) { bestScore = sc; best = a; }
+      };
+      for (const en of enemies) if (!en.dead && !en.resolved) consider(en.angle, en.z, en.lock);
+      for (const p of pickups) if (!p.done) consider(p.angle, p.z);
+      if (boss) consider(boss.angle, g.hitZ, undefined);
+      if (best !== null) nodes[i].raw += clamp(angDiff(best, nodes[i].raw), -0.6, 0.6) * 2.2 * dt;
+    }
+  }
+  for (const n of nodes) filterNode(n, dt);
+
   const waveMul = L.waves ? 1 + 0.3 * Math.sin(levelT * 0.55) : 1;
   const TOL = 0.314 * tolVis; // angular tolerance ~18°, eased wider by the wide-arc power-up
   const covers = (n, a) => Math.abs(angDiff(n.angle, a)) < TOL;
@@ -1788,14 +1849,14 @@ function drawGuideArc(n, targetA) {
 }
 
 // one audio channel row: label · angular toggle · tick-marked slider (shared by pause + menu)
-function settingRow(label, key, volKey, y, px, pw) {
+function settingRow(label, key, volKey, y, px, pw, tox) {
   ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(160,225,255,0.95)';
   try { ctx.letterSpacing = '2px'; } catch (e) {}
   ctx.font = '700 12px system-ui';
   ctx.fillText(label, px + 24, y + 4);
   try { ctx.letterSpacing = '0px'; } catch (e) {}
   // angular toggle slab
-  const tx = px + 96, tw = 52, th = 24, on = settings[key];
+  const tx = px + (tox || 96), tw = 52, th = 24, on = settings[key];
   techRect(tx, y - th / 2, tw, th, 6);
   ctx.fillStyle = on ? 'rgba(40,140,210,0.55)' : 'rgba(255,255,255,0.06)'; ctx.fill();
   ctx.strokeStyle = on ? 'rgba(140,230,255,0.8)' : 'rgba(120,180,255,0.3)'; ctx.lineWidth = 1.5;
@@ -1847,18 +1908,37 @@ function settingsTap(x, y, pid) {
 function drawPause() {
   pauseButtonsList = []; pauseSlidersList = []; pauseTogglesList = [];
   ctx.fillStyle = 'rgba(3,6,14,0.78)'; ctx.fillRect(0, 0, W, H);
-  const pw = Math.min(W * 0.74, 540), ph = Math.min(H * 0.84, 320);
+  const pw = Math.min(W * 0.9, 680), ph = Math.min(H * 0.88, 352);
   const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
   techPanel(px, py, pw, ph, 'SYSTEM PAUSED');
-  settingRow('SFX',     'sound',   'soundVol', py + 78,  px, pw);
-  settingRow('MUSIC',   'music',   'musicVol', py + 122, px, pw);
-  settingRow('HAPTICS', 'haptics', null,       py + 166, px, pw);
+  const colHdr = (t, x, y) => {
+    ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(120,210,255,0.75)';
+    try { ctx.letterSpacing = '2px'; } catch (e) {}
+    ctx.font = '700 11px system-ui';
+    ctx.fillText(t, x, y);
+    try { ctx.letterSpacing = '0px'; } catch (e) {}
+  };
+  const colW = pw * 0.54, cx0 = px + colW, colW2 = pw - colW - 24;
+  ctx.fillStyle = 'rgba(120,210,255,0.15)';
+  ctx.fillRect(cx0 - 2, py + 44, 1, ph - 118); // column divider
+  colHdr('AUDIO', px + 24, py + 56);
+  colHdr('CONTROL SCHEME', cx0 + 24, py + 56);
+  settingRow('SFX',     'sound',   'soundVol', py + 84,  px, colW);
+  settingRow('MUSIC',   'music',   'musicVol', py + 122, px, colW);
+  settingRow('HAPTICS', 'haptics', null,       py + 160, px, colW);
+  const ttx = colW2 - 76; // toggles right-aligned in the control column
+  settingRow('STEADY GRIP', 'steadyGrip', null, py + 84,  cx0, colW2, ttx);
+  settingRow('SMOOTHING',   'smoothing',  null, py + 122, cx0, colW2, ttx);
+  settingRow('FINE AIM',    'fineAim',    null, py + 160, cx0, colW2, ttx);
+  settingRow('AIM ASSIST',  'aimAssist',  null, py + 198, cx0, colW2, ttx);
+  settingRow('RATE MODE',   'rateMode',   null, py + 236, cx0, colW2, ttx);
   // live console readout, pure garnish
   ctx.fillStyle = 'rgba(120,210,255,0.35)'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-  ctx.fillText('m_fSfxVol = ' + settings.soundVol.toFixed(2) + 'f;   m_fMusicVol = ' + settings.musicVol.toFixed(2) + 'f;', px + 24, py + 196);
+  ctx.fillText('m_fSfxVol = ' + settings.soundVol.toFixed(2) + 'f;', px + 24, py + 196);
+  ctx.fillText('m_fMusicVol = ' + settings.musicVol.toFixed(2) + 'f;', px + 24, py + 212);
 
-  const bh = 46, gap = 12, bw = (pw - 48 - gap * 2) / 3;
-  let bx = px + 24; const by = py + ph - bh - 24;
+  const bh = 44, gap = 12, bw = (pw - 48 - gap * 2) / 3;
+  let bx = px + 24; const by = py + ph - bh - 18;
   [['RESUME', 'resume', true], ['RESTART', 'restart', false], ['QUIT', 'menu', false]].forEach(([label, action, primary]) => {
     button(bx, by, bw, bh, label, primary);
     pauseButtonsList.push({ x: bx, y: by, w: bw, h: bh, action });

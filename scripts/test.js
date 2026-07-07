@@ -16,10 +16,12 @@ const ctxStub = new Proxy({}, {
   },
   set: () => true
 });
+const canvasHandlers = {};
 const canvasStub = {
   width: 0, height: 0, style: {},
   getContext: () => ctxStub,
-  addEventListener() {}, setPointerCapture() {}
+  addEventListener(k, fn) { canvasHandlers[k] = fn; },
+  setPointerCapture() {}
 };
 global.document = {
   getElementById: () => canvasStub,
@@ -88,7 +90,7 @@ code = code.replace("'use strict';", '') + `
   boss: () => boss, endlessCfg, tut: () => tut, isEndless: () => endless, getLV: () => LV,
   startEndless, menuBtns: () => menuButtons, getEndWin: () => endWin,
   setLevelT: v => { levelT = v; }, setIntegrity: v => { integrity = v; }, setScore: v => { score = v; },
-  setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate
+  setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate, dialCenter
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -98,6 +100,7 @@ function check(name, cond) {
   console.log((cond ? 'PASS' : 'FAIL') + '  ' + name);
   if (!cond) failures++;
 }
+function aim(i, a) { G.nodes[i].angle = G.nodes[i].raw = a; }
 function cross(en) { // place at the ring and step one tick
   // (exactly hitZ so the hit check fires even when hit-stop slows the clock)
   const hz = G.geo().hitZ;
@@ -109,22 +112,22 @@ function cross(en) { // place at the ring and step one tick
 // ================= enemy hit logic =================
 G.startLevel(2);
 let en = G.spawnEnemy(0.1, 'normal');
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1;
+aim(0, Math.PI); aim(1, 0.1);
 cross(en);
 check('normal zapped by single node', en.dead === true);
 
 en = G.spawnEnemy(0.1, 'normal');
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = Math.PI / 2;
+aim(0, Math.PI); aim(1, Math.PI / 2);
 cross(en);
 check('normal missed when no node covers', en.resolved === true && !en.dead);
 
 en = G.spawnEnemy(0.1, 'heavy');
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1;
+aim(0, Math.PI); aim(1, 0.1);
 cross(en);
 check('heavy survives a single node', en.resolved === true && !en.dead);
 
 en = G.spawnEnemy(0.1, 'heavy');
-G.nodes[0].angle = 0.15; G.nodes[1].angle = 0.05;
+aim(0, 0.15); aim(1, 0.05);
 cross(en);
 check('heavy zapped by both nodes together', en.dead === true);
 
@@ -136,17 +139,17 @@ function makeLine(a1, a2) {
   return pair;
 }
 let [e1, e2] = makeLine(1.0, 2.0);
-G.nodes[0].angle = 1.0; G.nodes[1].angle = 2.0;
+aim(0, 1.0); aim(1, 2.0);
 cross(e1);
 check('line zapped with node per end', e1.dead && e2.dead);
 
 [e1, e2] = makeLine(1.0, 2.0);
-G.nodes[0].angle = 2.0; G.nodes[1].angle = 1.0;
+aim(0, 2.0); aim(1, 1.0);
 cross(e1);
 check('line zapped with swapped node assignment', e1.dead && e2.dead);
 
 [e1, e2] = makeLine(1.0, 2.0);
-G.nodes[0].angle = 1.0; G.nodes[1].angle = 1.05;
+aim(0, 1.0); aim(1, 1.05);
 cross(e1);
 check('line survives both nodes on one end', e1.resolved && e2.resolved && !e1.dead && !e2.dead);
 
@@ -195,7 +198,7 @@ check('perf watchdog trips lowFX after sustained slow frames', G.perf().lowFX ==
 // ================= zap juice =================
 G.startLevel(1);
 en = G.spawnEnemy(0.1, 'normal');
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1;
+aim(0, Math.PI); aim(1, 0.1);
 cross(en);
 check('zap spawns a lightning bolt', G.bolts().length > 0);
 check('zap triggers hit-stop', G.hitStop() > 0);
@@ -203,11 +206,11 @@ check('zap triggers hit-stop', G.hitStop() > 0);
 // ================= color-locked traps =================
 G.startLevel(5); // QUANTUM RELAY
 en = G.spawnEnemy(0.1, 'normal'); en.lock = 1; // white node only
-G.nodes[0].angle = 0.1; G.nodes[1].angle = Math.PI; // only the BLUE node covers it
+aim(0, 0.1); aim(1, Math.PI); // only the BLUE node covers it
 cross(en);
 check('color-locked trap ignores the wrong node', en.resolved === true && !en.dead);
 en = G.spawnEnemy(0.1, 'normal'); en.lock = 1;
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0.1; // WHITE node covers it
+aim(0, Math.PI); aim(1, 0.1); // WHITE node covers it
 cross(en);
 check('color-locked trap zapped by its matching node', en.dead === true);
 
@@ -219,7 +222,7 @@ G.fx.wide = 10;
 idle(30); // let the coverage arc ease out
 check('coverage arc eases out to the widened size', G.tolVis() > 1.6);
 en = G.spawnEnemy(0.45, 'normal'); // outside normal TOL (0.314), inside widened (~0.534)
-G.nodes[0].angle = Math.PI; G.nodes[1].angle = 0;
+aim(0, Math.PI); aim(1, 0);
 cross(en);
 check('wide-arc widens the hit window', en.dead === true);
 G.fx.wide = 0;
@@ -227,7 +230,7 @@ idle(30);
 check('coverage arc eases back to normal', G.tolVis() < 1.05);
 G.fx.auto = 5;
 en = G.spawnEnemy(2.5, 'normal');
-G.nodes[0].angle = 0; G.nodes[1].angle = 0.2; // nowhere near it
+aim(0, 0); aim(1, 0.2); // nowhere near it
 cross(en);
 check('auto-zap clears traps without coverage', en.dead === true);
 G.fx.auto = 0;
@@ -248,7 +251,7 @@ G.setIntegrity(100);
 G.spawnPickup();
 const pk = G.pickups()[G.pickups().length - 1];
 pk.kind = 'auto'; pk.z = G.geo().hitZ; pk.angle = 1.2;
-G.nodes[0].angle = 1.2;
+aim(0, 1.2);
 G.update(0.01);
 check('catching a pickup arms its effect', G.fx.auto > 4);
 G.fx.auto = 0;
@@ -264,13 +267,13 @@ G.update(0.01);
 check('firewall core spawns after the level clock', !!G.boss());
 const B = G.boss();
 B.z = G.geo().hitZ; B.angle = 1.0; B.drift = 0;
-G.nodes[0].angle = 1.0; G.nodes[1].angle = Math.PI; // one node parked on it
+aim(0, 1.0); aim(1, Math.PI); // one node parked on it
 G.update(0.05);
 check('node coverage drains the core', G.boss().hp < 8);
 let guard = 200;
 while (G.boss() && guard-- > 0) {
   G.boss().cd[0] = 0; G.boss().drift = 0; G.boss().angle = 1.0;
-  G.nodes[0].angle = 1.0;
+  aim(0, 1.0);
   G.update(0.05);
 }
 check('draining the core to zero wins the level', G.getState() === G.S.END && G.getEndWin() === true);
@@ -297,25 +300,98 @@ G.update(1.1);
 const tp1 = G.enemies().find(e => e.tut === 'L');
 check('tutorial spawns a slow left-side practice trap', !!tp1 && tp1.speedMul < 0.5);
 tp1.z = G.geo().hitZ;
-G.nodes[0].angle = tp1.angle + 1.5; G.nodes[1].angle = tp1.angle - 1.5; // miss it
+aim(0, tp1.angle + 1.5); aim(1, tp1.angle - 1.5); // miss it
 G.update(0.01);
 check('missed practice trap costs nothing', G.stats().integrity === 100 && G.stats().misses === 0);
 G.update(1.0);
 const tp2 = G.enemies().find(e => e.tut && !e.resolved && !e.dead);
 check('practice trap respawns after a miss', !!tp2);
 tp2.z = G.geo().hitZ;
-G.nodes[0].angle = tp2.angle;
+aim(0, tp2.angle);
 G.update(0.01); G.update(0.01);
 check('tutorial advances after the first zap', G.tut().step >= 2);
 G.update(1.3); G.update(1.3);
 const tp3 = G.enemies().find(e => e.tut === 'R' && !e.dead && !e.resolved);
 check('right-thumb practice trap spawns', !!tp3);
 tp3.z = G.geo().hitZ;
-G.nodes[1].angle = tp3.angle;
+aim(1, tp3.angle);
 G.update(0.01); G.update(0.01);
 G.update(1.7); G.update(1.7);
 check('tutorial completes and persists', G.tut() === null && G.progress.tutorialDone === true);
 check('spawns held during tutorial', true);
+
+// ================= control scheme =================
+function pdown(id, x, y) { canvasHandlers.pointerdown({ pointerId: id, clientX: x, clientY: y, pointerType: 'touch' }); }
+function pmove(id, x, y) { canvasHandlers.pointermove({ pointerId: id, clientX: x, clientY: y }); }
+function pup(id, x, y)   { canvasHandlers.pointerup({ pointerId: id, clientX: x, clientY: y }); }
+Object.assign(G.settings, { steadyGrip: false, smoothing: false, fineAim: false, aimAssist: false, rateMode: false });
+G.progress.tutorialDone = true;
+G.startLevel(0);
+const dial = G.dialCenter('L');
+const n0 = G.nodes[0];
+
+// baseline: rim quarter-turn → node quarter-turn
+aim(0, 0); n0.prevRaw = undefined; n0.dxHat = 0;
+pdown(9, dial.x + dial.r, dial.y);
+pmove(9, dial.x, dial.y + dial.r);
+G.update(0.016);
+check('raw drag: rim quarter-turn turns the node ~90°', Math.abs(n0.angle - Math.PI / 2) < 0.05);
+pup(9, dial.x, dial.y + dial.r);
+
+// steady grip: the same quarter-turn near the dial center is treated as jitter
+G.settings.steadyGrip = true;
+aim(0, 0); n0.prevRaw = undefined;
+pdown(9, dial.x + dial.r * 0.1, dial.y);
+pmove(9, dial.x, dial.y + dial.r * 0.1);
+G.update(0.016);
+check('steady grip kills near-center jitter', Math.abs(n0.angle) < 0.15);
+pup(9, dial.x, dial.y + dial.r * 0.1);
+G.settings.steadyGrip = false;
+
+// smoothing: jittering hold stays steady, fast swipe stays responsive
+G.settings.smoothing = true;
+aim(0, 1.0); n0.prevRaw = 1.0; n0.dxHat = 0;
+let maxDev = 0;
+for (let i = 0; i < 60; i++) {
+  n0.raw = 1.0 + (i % 2 ? 0.03 : -0.03);
+  G.update(0.016);
+  maxDev = Math.max(maxDev, Math.abs(n0.angle - 1.0));
+}
+check('smoothing steadies a jittering hold', maxDev < 0.015);
+n0.raw = n0.angle; n0.prevRaw = n0.raw; n0.dxHat = 0;
+for (let i = 0; i < 20; i++) { n0.raw += 0.15; G.update(0.016); }
+check('smoothing keeps fast swipes responsive', Math.abs(n0.raw - n0.angle) < 0.4);
+G.settings.smoothing = false;
+
+// fine aim: micro-deltas damped
+G.settings.fineAim = true;
+aim(0, 0);
+pdown(9, dial.x + dial.r, dial.y);
+pmove(9, dial.x + Math.cos(0.01) * dial.r, dial.y + Math.sin(0.01) * dial.r);
+check('fine aim damps micro-deltas', n0.raw > 0.001 && n0.raw < 0.008); // 0.01 rad in → ~0.005 out
+pup(9, dial.x + dial.r, dial.y);
+G.settings.fineAim = false;
+
+// rate mode: held offset = rotation speed
+G.settings.rateMode = true;
+aim(0, 0); n0.prevRaw = undefined;
+pdown(9, dial.x + dial.r, dial.y);
+pmove(9, dial.x, dial.y + dial.r); // hold at +90° offset
+for (let i = 0; i < 30; i++) { G.setIntegrity(100); G.update(0.05); }
+check('rate mode spins while an offset is held', n0.raw > 1.0);
+pup(9, dial.x, dial.y + dial.r);
+G.settings.rateMode = false;
+
+// aim assist: raw drifts toward an arriving trap
+G.settings.aimAssist = true;
+G.enemies().length = 0;
+aim(0, 0);
+en = G.spawnEnemy(0.3, 'normal');
+en.z = G.geo().hitZ + 0.2;
+G.update(0.05);
+check('aim assist pulls toward an arriving trap', n0.raw > 0.01);
+G.settings.aimAssist = false;
+Object.assign(G.settings, { steadyGrip: true, smoothing: true }); // restore defaults
 
 // ================= soak: simulated minutes of play =================
 let simNow = 500000; // monotonic clock for frame() across soaks
@@ -325,10 +401,10 @@ function soak(name, start, seconds) {
     for (let t = 0; t < seconds; t += 0.05) {
       const live = G.enemies().filter(e => !e.dead && !e.resolved);
       if (live.length) { // crude autopilot
-        G.nodes[0].angle = live[0].angle;
-        G.nodes[1].angle = live[live.length - 1].angle;
+        aim(0, live[0].angle);
+        aim(1, live[live.length - 1].angle);
       } else if (G.boss()) {
-        G.nodes[0].angle = G.boss().angle;
+        aim(0, G.boss().angle);
       }
       G.update(0.05);
       simNow += 50;
