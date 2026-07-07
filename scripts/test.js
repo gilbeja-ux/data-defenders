@@ -95,7 +95,7 @@ code = code.replace("'use strict';", '') + `
   detectBeat, beatQuantize, setBeat: (p, at) => { beatPeriod = p; musicStartAt = at; },
   patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
   getPerfects: () => perfects, getScore: () => score, ringAt: z => ring(z, geo()),
-  getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
+  getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT, setEndT: v => { endT = v; },
   startQualification, getInfoCard: () => infoCard, isQual: () => qual,
   keys, setBeamAim: (x, y) => { beamAim.x = x; beamAim.y = y; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
 };`;
@@ -558,6 +558,9 @@ G.setLevelT(60);
 G.enemies().length = 0;
 G.update(0.01);
 check('winning records a per-level best', G.getState() === G.S.END && G.progress.bests[1] === G.getScore() && G.getScore() > 0);
+G.setEndT(0.1); drawOk('end ceremony: banner fading in', () => {});
+G.setEndT(1.2); drawOk('end ceremony: counters running', () => {});
+G.setEndT(3.0); drawOk('end ceremony: buttons arrived', () => {});
 
 G.mutators.oneLife = true; G.mutators.fast = true;
 G.startLevel(1);

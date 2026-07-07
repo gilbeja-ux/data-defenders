@@ -535,6 +535,8 @@ let endless = false, qual = false, LV = null, runTrack = 0; // active run config
 let infoCard = null, infoShownAt = 0; // briefing card (S.INFO)
 let menuScroll = 0, menuPtr = null; // level-list scrolling
 let endWin = false, endStars = 0, endT = 0, endNewBest = false;
+let endFxStars = 0, endTickT = 0; // ceremony bookkeeping (star chimes, count ticks)
+const endBtnAt = () => endWin ? 2.1 : 1.25; // when the buttons arrive
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
 let menuSettings = false, menuGearRect = null, menuSetButtons = [], menuSetPanel = null, menuFsRect = null, menuMutRects = [];
 const pauseDrag = {};
@@ -1035,6 +1037,7 @@ function menuTap(x, y, pid) {
 }
 let endButtons = [];
 function endTap(x, y) {
+  if (endT < endBtnAt() + 0.15) { endT = endBtnAt() + 0.15; return; } // skip the ceremony
   for (const b of endButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
       sfx.tick();
@@ -1096,7 +1099,7 @@ function startEndless() {
 
 function endLevel(win) {
   beamSound(false, 0); beamActive = false;
-  endWin = win; endT = 0;
+  endWin = win; endT = 0; endFxStars = 0; endTickT = 0;
   endStars = win && !endless && !qual ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
   if (qual) {
     sfx.win();
@@ -2992,8 +2995,22 @@ function drawMenuSettings() {
 
 function drawEnd(g) {
   endButtons = [];
-  ctx.fillStyle = 'rgba(3,6,14,0.72)';
+  const ph = (a, b2) => clamp((endT - a) / (b2 - a), 0, 1);
+  // losses resolve fast; wins get the full ceremony
+  const T = endWin
+    ? { panel0: 0.15, panel1: 0.55, cnt0: 0.55, cnt1: 1.75, stars: 0.75, stats: 1.8 }
+    : { panel0: 0.05, panel1: 0.40, cnt0: 0.35, cnt1: 1.00, stars: 99,   stats: 1.0 };
+  const btnAt = endBtnAt();
+
+  // the live scene keeps breathing beneath — dim it in, don't cut
+  ctx.fillStyle = 'rgba(3,6,14,' + (0.72 * ph(0, 0.45)).toFixed(2) + ')';
   ctx.fillRect(0, 0, W, H);
+  if (endWin && endT < 0.35) { // victory flash seals the run
+    ctx.fillStyle = 'rgba(126,226,98,' + (0.28 * (1 - endT / 0.35)).toFixed(2) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+  const pA = ph(T.panel0, T.panel1);
+  if (pA <= 0.001) return;
 
   // build button list first so the report panel can wrap everything
   const list = [];
@@ -3003,26 +3020,52 @@ function drawEnd(g) {
   const bh = 50;
   const panelBottom = (isLandscape() ? H * 0.66 + bh : H * 0.62 + list.length * (bh + 14) - 14) + 24;
   const pw = Math.min(W * 0.88, 700), pTop = H * 0.13;
+
+  ctx.save();
+  const sc = 0.96 + 0.04 * (1 - Math.pow(1 - pA, 3));
+  ctx.translate(W / 2, H / 2); ctx.scale(sc, sc); ctx.translate(-W / 2, -H / 2);
+  ctx.globalAlpha = pA;
   techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + (endless ? 'ENDLESS STREAM' : qual ? 'QUALIFICATION' : LEVELS[levelIdx].name));
 
   ctx.textAlign = 'center';
+  // banner slams in
+  const tPop = 1 + 0.22 * (1 - ph(T.panel0, T.panel0 + 0.3));
   const endCol = endless ? '#ffb340' : qual && endWin ? '#7ee262' : endWin ? '#69e05c' : '#ff4a5e';
+  ctx.save();
+  ctx.translate(W / 2, H * 0.25 + 14);
+  ctx.scale(tPop, tPop);
   ctx.fillStyle = endCol;
   try { ctx.letterSpacing = '4px'; } catch (e) {}
   ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
   ctx.shadowColor = endCol; ctx.shadowBlur = 22;
-  ctx.fillText(endless ? 'STREAM SEVERED' : qual ? (endWin ? 'QUALIFIED' : 'TRAINING ABORTED') : endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
+  ctx.fillText(endless ? 'STREAM SEVERED' : qual ? (endWin ? 'QUALIFIED' : 'TRAINING ABORTED') : endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', 0, 0);
   ctx.shadowBlur = 0;
   try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.restore();
 
-  if (endWin && !qual) drawStars(W / 2, H * 0.36, endStars, Math.min(W, H) * 0.045, endT);
+  // stars pop one by one, each with a chime
+  if (endWin && !qual) {
+    drawStars(W / 2, H * 0.36, endStars, Math.min(W, H) * 0.045, endT - T.stars);
+    let popped = 0;
+    for (let i = 0; i < endStars; i++) if (endT - T.stars > 0.4 + i * 0.35) popped++;
+    if (popped > endFxStars) { endFxStars = popped; tone(760 + popped * 220, 0.2, 'triangle', 0.13, 900 + popped * 260); }
+  }
 
-  ctx.fillStyle = '#eaf4ff'; ctx.font = '700 26px system-ui';
-  ctx.fillText(score.toLocaleString(), W / 2, H * 0.47);
+  // the score counts itself up
+  const cntP = 1 - Math.pow(1 - ph(T.cnt0, T.cnt1), 3);
+  const shown = Math.round(score * cntP);
+  const counting = cntP > 0 && cntP < 1 && score > 0;
+  if (counting && time - endTickT > 0.07) { endTickT = time; tone(1500, 0.025, 'square', 0.035); }
+  ctx.fillStyle = '#eaf4ff';
+  ctx.font = '700 ' + (26 + (counting ? 2 : 0)) + 'px system-ui';
+  ctx.fillText(shown.toLocaleString(), W / 2, H * 0.47);
   ctx.fillStyle = 'rgba(160,215,255,0.7)'; ctx.font = '600 11px system-ui';
   try { ctx.letterSpacing = '3px'; } catch (e) {}
   ctx.fillText('SCORE', W / 2, H * 0.47 + 20);
   try { ctx.letterSpacing = '0px'; } catch (e) {}
+
+  // stats + best reveal after the count settles
+  ctx.globalAlpha = pA * ph(T.stats, T.stats + 0.3);
   ctx.fillStyle = 'rgba(140,210,255,0.65)'; ctx.font = '11px monospace';
   ctx.fillText('zapped: ' + zaps + '   //   perfect: ' + perfects + '   //   missed: ' + misses + '   //   integrity: ' + Math.round(integrity) + '%', W / 2, H * 0.47 + 44);
   if (endless) {
@@ -3034,25 +3077,34 @@ function drawEnd(g) {
     ctx.font = '700 13px system-ui';
     ctx.fillText((endNewBest ? 'NEW BEST  ' : 'BEST  ') + (progress.bests[levelIdx] || 0).toLocaleString(), W / 2, H * 0.47 + 68);
   }
-  if (isLandscape()) {
-    const bw = Math.min(W * 0.24, 210), gap = 16;
-    const total = list.length * bw + (list.length - 1) * gap;
-    let bx = W / 2 - total / 2;
-    const by = H * 0.66;
-    for (const b of list) {
-      button(bx, by, bw, bh, b.label, b.primary);
-      endButtons.push({ x: bx, y: by, w: bw, h: bh, action: b.action });
-      bx += bw + gap;
-    }
-  } else {
-    const bw = Math.min(W * 0.6, 260);
-    let by = H * 0.62;
-    for (const b of list) {
-      button(W / 2 - bw / 2, by, bw, bh, b.label, b.primary);
-      endButtons.push({ x: W / 2 - bw / 2, y: by, w: bw, h: bh, action: b.action });
-      by += bh + 14;
+
+  // buttons slide up last
+  const bA = ph(btnAt, btnAt + 0.4);
+  if (bA > 0.001) {
+    ctx.globalAlpha = pA * bA;
+    const rise = 14 * (1 - bA);
+    if (isLandscape()) {
+      const bw = Math.min(W * 0.24, 210), gap = 16;
+      const total = list.length * bw + (list.length - 1) * gap;
+      let bx = W / 2 - total / 2;
+      const by = H * 0.66;
+      for (const b of list) {
+        button(bx, by + rise, bw, bh, b.label, b.primary);
+        endButtons.push({ x: bx, y: by, w: bw, h: bh, action: b.action });
+        bx += bw + gap;
+      }
+    } else {
+      const bw = Math.min(W * 0.6, 260);
+      let by = H * 0.62;
+      for (const b of list) {
+        button(W / 2 - bw / 2, by + rise, bw, bh, b.label, b.primary);
+        endButtons.push({ x: W / 2 - bw / 2, y: by, w: bw, h: bh, action: b.action });
+        by += bh + 14;
+      }
     }
   }
+  ctx.restore();
+  ctx.globalAlpha = 1;
   ctx.textAlign = 'left';
 }
 
