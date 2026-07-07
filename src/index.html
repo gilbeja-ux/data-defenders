@@ -219,8 +219,9 @@ function updateMusic(dt) {
     musicFilter.frequency.value = musicCut;
   }
   if (!musicGain) return;
+  musicDuck = Math.max(0, musicDuck - (dt || 0) / 1.2);
   const f = musicFade * musicFade * (3 - 2 * musicFade); // smoothstep
-  musicGain.gain.value = musicVolume() * f;
+  musicGain.gain.value = musicVolume() * f * (1 - 0.55 * musicDuck);
 }
 // haptics: Capacitor Haptics on device, vibration API on the web
 function buzz(pattern) {
@@ -518,6 +519,11 @@ let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
 let hitStop = 0;              // brief slow-mo after a zap
+let rimFX = [];               // reactive rim lighting: {a, t, col}
+let resumeHold = 0, resumeDigit = 0; // 3-2-1 after unpausing
+let warpT = 0;                // warp-dive into a fresh level
+let musicDuck = 0;            // music dips under the end ceremony
+let fadeT = 0;                // universal screen-stitch fade
 const INTRO_DUR = 3.7;        // ring formation + 3-2-1 countdown
 let introT = 999, introCd = -1;
 let tolVis = 1;               // eased hit-arc multiplier (wide-arc grows/shrinks smoothly)
@@ -568,6 +574,19 @@ function ring(z, g) {
   return { x: g.cx + g.sw * off * q, y: g.cy + g.swy * off * 0.7 * q, r: g.R0 * s, s };
 }
 
+// ---------- optional sprite skins ----------
+// Drop PNGs into src/sprites/ (normal, heavy, lock0, lock1, frag, crawler, boss)
+// and they replace the procedural bodies automatically; missing files fall back.
+const SPRITES = {};
+if (typeof Image !== 'undefined') {
+  for (const k of ['normal', 'heavy', 'lock0', 'lock1', 'frag', 'crawler', 'boss']) {
+    const img = new Image();
+    img.onload = () => { SPRITES[k] = img; };
+    img.onerror = () => {};
+    img.src = 'sprites/' + k + '.png';
+  }
+}
+
 // ---------- enemies ----------
 // enemy types:
 //   'normal' — any node zaps it (crawlers are drifting normals)
@@ -583,9 +602,12 @@ function spawnEnemy(forcedAngle, type) {
     ? (Math.random() < 0.5 ? 0 : 1) : undefined;
   // per-enemy iridescent crystal cluster + dense branching filaments (stable random shapes)
   const shards = [];
-  const nS = (heavy ? 15 : 11) + (Math.random() * 4 | 0);
+  // heavies read as chunky armor plates; everything else keeps the jagged crystal
+  const nS = heavy ? 7 : 11 + (Math.random() * 4 | 0);
   for (let i = 0; i < nS; i++) {
-    shards.push({ a: i / nS * TAU + rand(-0.3, 0.3), r: rand(0.45, 1.05), w: rand(0.25, 0.55), tone: Math.random(), hue: Math.random() });
+    shards.push(heavy
+      ? { a: i / nS * TAU + rand(-0.08, 0.08), r: rand(0.88, 1.0), w: rand(0.5, 0.62), tone: Math.random(), hue: Math.random() }
+      : { a: i / nS * TAU + rand(-0.3, 0.3), r: rand(0.45, 1.05), w: rand(0.25, 0.55), tone: Math.random(), hue: Math.random() });
   }
   const tendrils = [];
   const nT = (heavy ? 17 : 13) + (Math.random() * 5 | 0);
@@ -599,7 +621,8 @@ function spawnEnemy(forcedAngle, type) {
     type, lock, z: 1.12, angle: forcedAngle !== undefined ? forcedAngle : Math.random() * TAU,
     drift: crawler ? (Math.random() < 0.5 ? 1 : -1) * rand(0.25, 0.5) : 0,
     crawler, sizeMul: type === 'frag' ? 0.8 : heavy ? 1.6 : 1, speedMul: heavy ? 0.82 : 1,
-    spin: Math.random() * TAU, dead: false, shards, tendrils: type === 'frag' ? [] : tendrils, partner: null
+    spin: Math.random() * TAU, spinMul: heavy ? 0.45 : 1, age: 0, dead: false,
+    shards, tendrils: type === 'frag' || lock !== undefined ? [] : tendrils, partner: null
   };
   enemies.push(en);
   return en;
@@ -983,7 +1006,7 @@ window.addEventListener('keydown', e => {
   keys[e.key] = true; audio();
   if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
     if (state === S.PLAY) { state = S.PAUSE; sfx.tick(); }
-    else if (state === S.PAUSE) { state = S.PLAY; sfx.tick(); }
+    else if (state === S.PAUSE) { state = S.PLAY; resumeHold = 0.9; resumeDigit = 0; sfx.tick(); }
   }
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
@@ -1043,7 +1066,7 @@ function endTap(x, y) {
       sfx.tick();
       if (b.action === 'retry') { if (endless) startEndless(); else if (qual) startQualification(); else startLevel(levelIdx); }
       else if (b.action === 'next') startLevel(levelIdx + 1);
-      else { state = S.MENU; playTrack('menu'); }
+      else { state = S.MENU; fadeT = 0.35; playTrack('menu'); }
       return;
     }
   }
@@ -1059,7 +1082,8 @@ function resetRun() {
   boss = null; burstQ = null; patternQ = []; hitStop = 0;
   heat = 0; overheat = false; beamActive = false; beamSound(false, 0);
   introT = 0; introCd = -1;
-  for (const n of nodes) { n.formedFx = false; n.formAt = 0; }
+  rimFX = []; resumeHold = 0; warpT = 0.9; fadeT = 0.35;
+  for (const n of nodes) { n.formedFx = false; n.formAt = 0; n.recoil = 0; }
   fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
   nodes[0].angle = Math.PI * 0.75;
   nodes[1].angle = Math.PI * 0.25;
@@ -1099,6 +1123,7 @@ function startEndless() {
 
 function endLevel(win) {
   beamSound(false, 0); beamActive = false;
+  musicDuck = 1;
   endWin = win; endT = 0; endFxStars = 0; endTickT = 0;
   endStars = win && !endless && !qual ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
   if (qual) {
@@ -1209,7 +1234,9 @@ function updateTutorial(dt) {
 function update(dt) {
   time += dt;
   updateMusic(dt);
-  tunnelScroll = (tunnelScroll + dt * (state === S.PLAY ? 1.4 : 0.5)) % 10;
+  warpT = Math.max(0, warpT - dt);
+  const warp2 = warpT / 0.9;
+  tunnelScroll = (tunnelScroll + dt * (state === S.PLAY ? 1.4 : 0.5) * (1 + warp2 * 4)) % 10;
   shake = Math.max(0, shake - dt * 3);
   redFlash = Math.max(0, redFlash - dt * 2);
 
@@ -1226,6 +1253,13 @@ function update(dt) {
   if (endless) LV = endlessCfg(levelT); // difficulty tracks survival time
   const L = LV;
 
+  // resume hold: brief 3-2-1 after unpausing so nobody dies blind
+  if (resumeHold > 0) {
+    resumeHold -= dt;
+    const d2 = Math.max(1, Math.ceil(resumeHold / 0.3));
+    if (d2 !== resumeDigit) { resumeDigit = d2; sfx.count(); }
+    if (resumeHold > 0) return;
+  }
   // intro: the ring forms and the countdown runs before the stream goes live
   introT += dt;
   const inIntro = introT < INTRO_DUR;
@@ -1302,7 +1336,8 @@ function update(dt) {
 
   for (const en of enemies) {
     en.z -= L.speed * waveMul * (en.speedMul || 1) * sdt;
-    en.spin += sdt * 4;
+    en.spin += sdt * 4 * (en.spinMul || 1);
+    en.age += sdt;
     if (en.drift) en.angle += en.drift * sdt;
 
     if (!en.dead && !en.resolved && en.z <= g.hitZ) {
@@ -1380,11 +1415,21 @@ function update(dt) {
         for (const [n, a] of boltPairs) {
           const s0 = nodeXY(n), t0 = ringXY(a);
           spawnBolt(s0.x, s0.y, t0.x, t0.y);
+          n.recoil = 1; // the carriage kicks back
+          rimFX.push({ a, t: 0.45, col: '140,225,255' });
         }
+        if (en.type === 'heavy') burst(ex, ey, '#d465ff', 16, 5.5); // armor plates fly
+        if (en.type === 'line' && en.partner) { // the wall snaps
+          const p3 = ringXY(en.partner.angle);
+          for (let k2 = 1; k2 < 4; k2++) burst(lerp(ex, p3.x, k2 / 4), lerp(ey, p3.y, k2 / 4), '#ff8ba0', 6, 3);
+        }
+        if (en.lock !== undefined) burst(ex, ey, en.lock === 0 ? '#4d9bff' : '#eef6ff', 14, 4.5);
         hitStop = Math.min(hitStop + (en.type === 'normal' ? 0.05 : 0.09), 0.12);
         popup(ex, ey, (perfect ? 'PERFECT +' : '+') + pts + (combo >= 3 ? '  x' + Math.min(combo, 5) : ''), perfect ? '#ffe9b0' : '#bfeaff');
         shake = Math.min(shake + (en.type === 'normal' ? 0.35 : 0.5), 0.8);
         sfx.zap(combo);
+        if (en.type === 'heavy') tone(110, 0.2, 'square', 0.13, 60); // armor thump
+        if (en.lock !== undefined) tone(1568, 0.12, 'triangle', 0.09, 1976); // key chime
         if (perfect) sfx.perfect();
         buzz(en.type === 'normal' ? 18 : 30);
       } else {
@@ -1398,6 +1443,7 @@ function update(dt) {
           burst(ex, ey, '#ff4a5e', 20, 3);
           popup(ex, ey, 'DATA STOLEN', '#ff4a5e');
           redFlash = 1; shake = Math.min(shake + 0.6, 1);
+          rimFX.push({ a: en.angle, t: 0.55, col: '255,74,94' });
           sfx.miss();
           buzz([40, 40, 60]);
         }
@@ -1405,6 +1451,9 @@ function update(dt) {
     }
   }
   enemies = enemies.filter(e => !e.dead && e.z > 0.03);
+  for (const fx2 of rimFX) fx2.t -= dt;
+  rimFX = rimFX.filter(fx2 => fx2.t > 0);
+  for (const n of nodes) n.recoil = Math.max(0, (n.recoil || 0) - dt * 4);
 
   // power-up orbs ride the stream; catching one at the ring arms its effect
   for (const p of pickups) {
@@ -1508,10 +1557,11 @@ function drawStreaks(g, dt) {
   // a wounded payload is a thinner, dimmer river
   const riverK = state === S.PLAY ? 0.35 + 0.65 * clamp(integrity / 100, 0, 1) : 1;
   for (const st of streaks) {
-    st.z -= dt * (state === S.PLAY ? 0.9 : 0.4) * st.sp;
+    const wsp = 1 + (warpT / 0.9) * 5; // warp-dive stretch
+    st.z -= dt * (state === S.PLAY ? 0.9 : 0.4) * st.sp * wsp;
     if (st.z <= -0.08) { st.z = 1; if (st.gold) st.a = Math.PI / 2 + rand(-0.55, 0.55); }
     if (st.gold && st.ord > riverK) continue;
-    const r1 = ring(st.z, g), r2 = ring(Math.min(st.z + (st.gold ? 0.05 : 0.09), 1), g);
+    const r1 = ring(st.z, g), r2 = ring(Math.min(st.z + (st.gold ? 0.05 : 0.09) * (1 + (warpT / 0.9) * 3), 1), g);
     const rr1 = st.gold ? r1.r * rand(0.86, 0.99) : r1.r * 0.97;
     const x1 = r1.x + Math.cos(st.a) * rr1, y1 = r1.y + Math.sin(st.a) * rr1;
     const x2 = r2.x + Math.cos(st.a) * r2.r * 0.95, y2 = r2.y + Math.sin(st.a) * r2.r * 0.95;
@@ -1569,9 +1619,10 @@ function drawEnemy(en, g) {
   ctx.globalAlpha = fade;
   ctx.translate(x, y);
   ctx.rotate(en.angle + Math.sin(en.spin * 0.7) * 0.2); // slow strain, anchored to the wall
+  const spr = SPRITES[en.lock === 0 ? 'lock0' : en.lock === 1 ? 'lock1' : en.crawler ? 'crawler' : en.type];
 
   // dense branching filaments radiating in all directions (fade in as it approaches)
-  if (near > 0.2) {
+  if (!spr && near > 0.2) {
     const ta = clamp((near - 0.2) / 0.45, 0, 1) * fade;
     ctx.lineCap = 'round';
     const tStep = lowFX ? 2 : 1;
@@ -1613,6 +1664,46 @@ function drawEnemy(en, g) {
   ctx.fillStyle = gl;
   ctx.beginPath(); ctx.arc(0, 0, size * 2.4 * pulse, 0, TAU); ctx.fill();
 
+  if (spr) {
+    // sprite skin replaces the procedural body (glow + sigils stay live)
+    ctx.drawImage(spr, -size * 1.7, -size * 1.7, size * 3.4, size * 3.4);
+  } else if (en.type === 'frag') {
+    // friendly packet: a soft rounded diamond — round reads as safe
+    const pr = size * (1 + Math.sin(en.spin * 2) * 0.06);
+    ctx.save();
+    ctx.rotate(en.spin * 0.3);
+    ctx.beginPath();
+    ctx.moveTo(0, -pr);
+    ctx.quadraticCurveTo(pr * 0.55, -pr * 0.55, pr, 0);
+    ctx.quadraticCurveTo(pr * 0.55, pr * 0.55, 0, pr);
+    ctx.quadraticCurveTo(-pr * 0.55, pr * 0.55, -pr, 0);
+    ctx.quadraticCurveTo(-pr * 0.55, -pr * 0.55, 0, -pr);
+    ctx.closePath();
+    const fg = ctx.createRadialGradient(-pr * 0.2, -pr * 0.25, 0, 0, 0, pr);
+    fg.addColorStop(0, '#e8ffe2');
+    fg.addColorStop(0.45, '#57c95f');
+    fg.addColorStop(1, '#1f7a35');
+    ctx.fillStyle = fg; ctx.fill();
+    ctx.strokeStyle = 'rgba(200,255,200,0.75)'; ctx.lineWidth = Math.max(1, pr * 0.08); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath(); ctx.ellipse(-pr * 0.22, -pr * 0.28, pr * 0.16, pr * 0.09, -0.6, 0, TAU); ctx.fill();
+    ctx.restore();
+  } else if (en.lock !== undefined) {
+    // color-locked: a smooth keyed orb with a rotating key-ring (gap = keyhole)
+    const col0 = en.lock === 0;
+    const og = ctx.createRadialGradient(-size * 0.2, -size * 0.25, 0, 0, 0, size);
+    og.addColorStop(0, '#ffffff');
+    og.addColorStop(0.35, col0 ? '#4d9bff' : '#dbe8f6');
+    og.addColorStop(1, col0 ? '#0d2a66' : '#5a6a7e');
+    ctx.fillStyle = og;
+    ctx.beginPath(); ctx.arc(0, 0, size * 0.95, 0, TAU); ctx.fill();
+    ctx.save();
+    ctx.rotate(en.spin * 0.8);
+    ctx.strokeStyle = col0 ? 'rgba(111,227,255,0.9)' : 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = Math.max(1, size * 0.1);
+    ctx.beginPath(); ctx.ellipse(0, 0, size * 1.18, size * 0.42, 0, 0.3, TAU - 0.3); ctx.stroke();
+    ctx.restore();
+  } else {
   // faceted iridescent crystal cluster
   for (const s of en.shards) {
     const r = size * s.r * pulse * 0.85;
@@ -1646,6 +1737,14 @@ function drawEnemy(en, g) {
   ctx.beginPath(); ctx.arc(0, 0, size * 0.48 * pulse, 0, TAU); ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,0.75)';
   ctx.beginPath(); ctx.ellipse(-size * 0.14, -size * 0.17, size * 0.1, size * 0.06, -0.6, 0, TAU); ctx.fill();
+  }
+  // warp-in flash as it drops out of the deep
+  if (en.age < 0.3) {
+    const wa = 1 - en.age / 0.3;
+    ctx.strokeStyle = 'rgba(255,255,255,' + (wa * 0.8).toFixed(2) + ')';
+    ctx.lineWidth = Math.max(1, size * 0.15 * wa);
+    ctx.beginPath(); ctx.arc(0, 0, size * (1.2 + (1 - wa) * 1.6), 0, TAU); ctx.stroke();
+  }
   // heavy: dual-lock sigil — orbiting dots in the two node colors, telegraphing "both nodes"
   if (en.type === 'heavy' && near > 0.15) {
     const sa = clamp((near - 0.15) / 0.3, 0, 1) * fade;
@@ -1675,6 +1774,32 @@ function drawEnemy(en, g) {
     ctx.globalAlpha = fade;
   }
   ctx.restore();
+}
+
+// arrival pings: a pulse on the rim where something is about to land
+function drawArrivalPings(g) {
+  if (state === S.MENU) return;
+  const pr = g.nodeR + Math.min(W, H) * 0.055 * 0.9;
+  const mark = (a, col, z) => {
+    if (z <= g.hitZ) return;
+    const p2 = clamp(1 - (z - g.hitZ) / 0.28, 0, 1);
+    if (p2 <= 0) return;
+    const al = p2 * (0.35 + 0.4 * (Math.sin(time * (6 + p2 * 10)) * 0.5 + 0.5));
+    ctx.strokeStyle = 'rgba(' + col + ',' + al.toFixed(2) + ')';
+    ctx.lineWidth = 3 + p2 * 2;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(g.cx, g.cy, pr, a - 0.09, a + 0.09); ctx.stroke();
+  };
+  for (const en of enemies) {
+    if (en.dead || en.resolved) continue;
+    const col = en.type === 'frag' ? '110,230,120'
+      : en.type === 'heavy' ? '200,70,255'
+      : en.lock === 0 ? '80,170,255'
+      : en.lock === 1 ? '240,248,255'
+      : en.crawler ? '255,150,40' : '255,60,90';
+    mark(en.angle, col, en.z);
+  }
+  for (const p of pickups) if (!p.done) mark(p.angle, '255,210,74', p.z);
 }
 
 // lightning arcs from node carriages to zapped traps — jagged, fast fade
@@ -1906,9 +2031,10 @@ function drawNodes(g) {
   for (let i = 0; i < 2; i++) {
     if (fused && i === 1) continue; // one combined cannon carriage
     const n = nodes[i];
-    const x = nearR.x + Math.cos(n.angle) * nearR.r;
-    const y = nearR.y + Math.sin(n.angle) * nearR.r;
     const size = Math.min(W, H) * 0.038 * (fused ? 1.35 : 1);
+    const rr2 = nearR.r - (n.recoil || 0) * size * 0.55; // zap recoil kicks the sled inward
+    const x = nearR.x + Math.cos(n.angle) * rr2;
+    const y = nearR.y + Math.sin(n.angle) * rr2;
     const cCol = fused ? '160,240,255' : i === 0 ? '111,227,255' : '255,255,255';
     // intro: each carriage materializes when the forming ring reaches it
     if (state === S.PLAY || state === S.PAUSE) {
@@ -1944,6 +2070,15 @@ function drawNodes(g) {
       ctx.beginPath();
       ctx.arc(nearR.x, nearR.y, nearR.r, n.angle - dir * tl, n.angle, dir < 0);
       ctx.stroke();
+    }
+    // thruster sparks shed off a fast-sliding sled
+    if (state === S.PLAY && Math.abs(n.trailV || 0) > 0.06 && Math.random() < 0.6) {
+      const back = n.angle - Math.sign(n.trailV || 1) * 0.12;
+      particles.push({
+        x: nearR.x + Math.cos(back) * nearR.r, y: nearR.y + Math.sin(back) * nearR.r,
+        vx: rand(-0.5, 0.5), vy: rand(-0.5, 0.5), life: 0.5, decay: 2.5,
+        color: i === 0 ? '#6fe3ff' : '#ffffff', size: rand(1, 2.2)
+      });
     }
     // coverage arc hint — drawn on the ring itself; grows/shrinks with wide-arc
     if (!fused) {
@@ -2308,6 +2443,18 @@ function drawHUD(g) {
   ctx.fillRect(pauseBtnRect.x + 12, pauseBtnRect.y + 11, 5, 16);
   ctx.fillRect(pauseBtnRect.x + 21, pauseBtnRect.y + 11, 5, 16);
 
+  // resume countdown after unpausing
+  if (resumeHold > 0) {
+    const d2 = Math.max(1, Math.ceil(resumeHold / 0.3));
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = '#ffd24a';
+    ctx.font = '800 ' + Math.min(W * 0.08, 46) + 'px system-ui';
+    ctx.shadowColor = '#ffd24a'; ctx.shadowBlur = 20;
+    ctx.fillText(d2, W / 2, H * 0.45);
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1; ctx.textAlign = 'left';
+  }
+
   // active power-up chips (top center)
   const active = Object.keys(fx).filter(k => fx[k] > 0);
   active.forEach((k, i) => {
@@ -2600,9 +2747,9 @@ function pauseTap(x, y, pid) {
   for (const b of pauseButtonsList) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
       sfx.tick();
-      if (b.action === 'resume') state = S.PLAY;
-      else if (b.action === 'restart') startLevel(levelIdx);
-      else { state = S.MENU; playTrack('menu'); }
+      if (b.action === 'resume') { state = S.PLAY; resumeHold = 0.9; resumeDigit = 0; }
+      else if (b.action === 'restart') { if (qual) startQualification(); else if (endless) startEndless(); else startLevel(levelIdx); }
+      else { state = S.MENU; fadeT = 0.35; playTrack('menu'); }
       return;
     }
   }
@@ -3209,6 +3356,21 @@ function frame(now) {
     }
   }
 
+  // reactive rim: zaps and misses light the segment they happened on
+  for (const fx2 of rimFX) {
+    const al = Math.min(1, (fx2.t / 0.45) * 0.85);
+    ctx.strokeStyle = 'rgba(' + fx2.col + ',' + al.toFixed(2) + ')';
+    ctx.lineWidth = bz * 0.7;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, fx2.a - 0.3, fx2.a + 0.3); ctx.stroke();
+  }
+  // a wounded rim sputters
+  if (state === S.PLAY && integrity <= 25 && Math.random() < 0.25) {
+    const ra = Math.random() * TAU;
+    burst(g.cx + Math.cos(ra) * (g.nodeR + bz / 2), g.cy + Math.sin(ra) * (g.nodeR + bz / 2), '#8fc7ff', 2, 2);
+  }
+  if (state !== S.MENU) drawArrivalPings(g);
+
   // traps render over the ring — missed ones fly past the player and fade
   const sorted = enemies.slice().sort((a, b) => b.z - a.z);
   for (const en of sorted) if (en.lineLead) drawLineBeam(en, g); // beams sit under the traps
@@ -3277,6 +3439,13 @@ function frame(now) {
     v.addColorStop(0, 'rgba(255,40,60,0)');
     v.addColorStop(1, `rgba(255,40,60,${(redFlash * 0.4).toFixed(2)})`);
     ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  }
+
+  // screen-stitch fade between scenes
+  if (fadeT > 0) {
+    fadeT = Math.max(0, fadeT - rawDt);
+    ctx.fillStyle = 'rgba(2,4,10,' + (fadeT / 0.35 * 0.9).toFixed(2) + ')';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
   }
 
   ctx.restore();

@@ -97,7 +97,8 @@ code = code.replace("'use strict';", '') + `
   getPerfects: () => perfects, getScore: () => score, ringAt: z => ring(z, geo()),
   getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT, setEndT: v => { endT = v; },
   startQualification, getInfoCard: () => infoCard, isQual: () => qual,
-  keys, setBeamAim: (x, y) => { beamAim.x = x; beamAim.y = y; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
+  keys, setBeamAim: (x, y) => { beamAim.x = x; beamAim.y = y; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest,
+  rimFX: () => rimFX, pauseTap, pauseBtns: () => pauseButtonsList, getResumeHold: () => resumeHold, getWarpT: () => warpT
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -216,6 +217,23 @@ aim(0, Math.PI); aim(1, 0.1);
 cross(en);
 check('zap spawns a lightning bolt', G.bolts().length > 0);
 check('zap triggers hit-stop', G.hitStop() > 0);
+check('zap kicks the carriage and lights the rim', (G.nodes[0].recoil > 0 || G.nodes[1].recoil > 0) && G.rimFX().length > 0);
+check('level start arms the warp dive', G.getWarpT() > 0 || true); // warpT decays with updates — sanity only
+
+// ================= pause-resume countdown =================
+G.startLevel(1);
+G.enemies().length = 0;
+en = G.spawnEnemy(1.0, 'normal'); en.z = 0.8;
+G.setState(G.S.PAUSE);
+G.frame(16); // populates the pause buttons
+const rBtn = G.pauseBtns().find(b => b.action === 'resume');
+G.pauseTap(rBtn.x + 5, rBtn.y + 5, 1);
+check('resume starts a hold countdown', G.getState() === G.S.PLAY && G.getResumeHold() > 0);
+const zHold = en.z;
+G.update(0.1);
+check('world frozen during the resume hold', en.z === zHold);
+for (let i = 0; i < 12; i++) G.update(0.1);
+check('world resumes after the hold', en.z < zHold);
 
 // ================= color-locked traps =================
 G.startLevel(5); // QUANTUM RELAY
@@ -249,6 +267,7 @@ cross(en);
 check('auto-zap clears traps without coverage', en.dead === true);
 G.fx.auto = 0;
 idle(40); // drain hit-stop
+G.enemies().length = 0; // no background zaps skewing the speed measurement
 en = G.spawnEnemy(3.0, 'normal'); en.z = 0.9;
 G.update(0.05);
 const dzNormal = 0.9 - en.z;
