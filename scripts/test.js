@@ -100,7 +100,7 @@ function check(name, cond) {
   console.log((cond ? 'PASS' : 'FAIL') + '  ' + name);
   if (!cond) failures++;
 }
-function aim(i, a) { G.nodes[i].angle = G.nodes[i].raw = a; }
+function aim(i, a) { G.nodes[i].angle = a; }
 function cross(en) { // place at the ring and step one tick
   // (exactly hitZ so the hit check fires even when hit-stop slows the clock)
   const hz = G.geo().hitZ;
@@ -324,74 +324,36 @@ check('spawns held during tutorial', true);
 function pdown(id, x, y) { canvasHandlers.pointerdown({ pointerId: id, clientX: x, clientY: y, pointerType: 'touch' }); }
 function pmove(id, x, y) { canvasHandlers.pointermove({ pointerId: id, clientX: x, clientY: y }); }
 function pup(id, x, y)   { canvasHandlers.pointerup({ pointerId: id, clientX: x, clientY: y }); }
-Object.assign(G.settings, { steadyGrip: false, smoothing: false, fineAim: false, aimAssist: false, rateMode: false });
 G.progress.tutorialDone = true;
 G.startLevel(0);
 const dial = G.dialCenter('L');
 const n0 = G.nodes[0];
 
-// baseline: rim quarter-turn → node quarter-turn
-aim(0, 0); n0.prevRaw = undefined; n0.dxHat = 0;
-pdown(9, dial.x + dial.r, dial.y);
-pmove(9, dial.x, dial.y + dial.r);
-G.update(0.016);
-check('raw drag: rim quarter-turn turns the node ~90°', Math.abs(n0.angle - Math.PI / 2) < 0.05);
-pup(9, dial.x, dial.y + dial.r);
-
-// steady grip: the same quarter-turn near the dial center is treated as jitter
-G.settings.steadyGrip = true;
-aim(0, 0); n0.prevRaw = undefined;
-pdown(9, dial.x + dial.r * 0.1, dial.y);
-pmove(9, dial.x, dial.y + dial.r * 0.1);
-G.update(0.016);
-check('steady grip kills near-center jitter', Math.abs(n0.angle) < 0.15);
-pup(9, dial.x, dial.y + dial.r * 0.1);
-G.settings.steadyGrip = false;
-
-// smoothing: jittering hold stays steady, fast swipe stays responsive
-G.settings.smoothing = true;
-aim(0, 1.0); n0.prevRaw = 1.0; n0.dxHat = 0;
-let maxDev = 0;
-for (let i = 0; i < 60; i++) {
-  n0.raw = 1.0 + (i % 2 ? 0.03 : -0.03);
-  G.update(0.016);
-  maxDev = Math.max(maxDev, Math.abs(n0.angle - 1.0));
-}
-check('smoothing steadies a jittering hold', maxDev < 0.015);
-n0.raw = n0.angle; n0.prevRaw = n0.raw; n0.dxHat = 0;
-for (let i = 0; i < 20; i++) { n0.raw += 0.15; G.update(0.016); }
-check('smoothing keeps fast swipes responsive', Math.abs(n0.raw - n0.angle) < 0.4);
-G.settings.smoothing = false;
-
-// fine aim: micro-deltas damped
-G.settings.fineAim = true;
+// raw 1:1 relative drag: rim quarter-turn → node quarter-turn, zero lag
 aim(0, 0);
 pdown(9, dial.x + dial.r, dial.y);
-pmove(9, dial.x + Math.cos(0.01) * dial.r, dial.y + Math.sin(0.01) * dial.r);
-check('fine aim damps micro-deltas', n0.raw > 0.001 && n0.raw < 0.008); // 0.01 rad in → ~0.005 out
-pup(9, dial.x + dial.r, dial.y);
-G.settings.fineAim = false;
-
-// rate mode: held offset = rotation speed
-G.settings.rateMode = true;
-aim(0, 0); n0.prevRaw = undefined;
-pdown(9, dial.x + dial.r, dial.y);
-pmove(9, dial.x, dial.y + dial.r); // hold at +90° offset
-for (let i = 0; i < 30; i++) { G.setIntegrity(100); G.update(0.05); }
-check('rate mode spins while an offset is held', n0.raw > 1.0);
+pmove(9, dial.x, dial.y + dial.r);
+check('raw drag: rim quarter-turn turns the node ~90° instantly', Math.abs(n0.angle - Math.PI / 2) < 1e-6);
 pup(9, dial.x, dial.y + dial.r);
-G.settings.rateMode = false;
 
-// aim assist: raw drifts toward an arriving trap
+// aim assist off: no drift toward traps
+G.settings.aimAssist = false;
+G.enemies().length = 0;
+aim(0, 0);
+en = G.spawnEnemy(0.3, 'normal');
+en.z = G.geo().hitZ + 0.2;
+G.update(0.05);
+check('no assist drift when aim assist is off', Math.abs(n0.angle) < 1e-6);
+
+// aim assist on: node drifts toward the arriving trap
 G.settings.aimAssist = true;
 G.enemies().length = 0;
 aim(0, 0);
 en = G.spawnEnemy(0.3, 'normal');
 en.z = G.geo().hitZ + 0.2;
 G.update(0.05);
-check('aim assist pulls toward an arriving trap', n0.raw > 0.01);
+check('aim assist pulls toward an arriving trap', n0.angle > 0.01);
 G.settings.aimAssist = false;
-Object.assign(G.settings, { steadyGrip: true, smoothing: true }); // restore defaults
 
 // ================= soak: simulated minutes of play =================
 let simNow = 500000; // monotonic clock for frame() across soaks
