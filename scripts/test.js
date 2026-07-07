@@ -94,7 +94,7 @@ code = code.replace("'use strict';", '') + `
   setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate, dialCenter,
   detectBeat, beatQuantize, setBeat: (p, at) => { beatPeriod = p; musicStartAt = at; },
   patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
-  getPerfects: () => perfects, getScore: () => score,
+  getPerfects: () => perfects, getScore: () => score, ringAt: z => ring(z, geo()),
   getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
   startQualification, getInfoCard: () => infoCard, isQual: () => qual,
   keys, setBeamAim: (x, y) => { beamAim.x = x; beamAim.y = y; }, getHeat: () => heat, isOverheat: () => overheat, startBossTest
@@ -286,12 +286,20 @@ check('briefing dismissed back to the duel', G.getState() === G.S.PLAY);
 for (let i = 0; i < 40 && G.boss().mergeT < 1; i++) G.update(0.05);
 check('nodes fuse into the ray cannon', G.boss().mergeT >= 1 && Math.abs(G.nodes[0].angle - G.nodes[1].angle) < 1e-6);
 function aimBeam() {
+  // solve the stick so the straight screen ray passes through the core:
+  // the far endpoint T is linear in the stick vector, so invert directly
   const g2 = G.geo();
   const b = G.boss();
   aim(0, Math.atan2(b.v, b.u)); aim(1, G.nodes[0].angle); // swing the cannon toward it
-  const dz = b.z - g2.hitZ;
-  const u0 = Math.cos(G.nodes[0].angle), v0 = Math.sin(G.nodes[0].angle);
-  G.setBeamAim((b.u - u0) / (5 * dz), (b.v - v0) / (5 * dz)); // beam crosses the core's depth on target
+  const A = G.nodes[0].angle;
+  const railR = g2.nodeR - Math.min(800, 450) * 0.055 * 0.86;
+  const sx = g2.cx + Math.cos(A) * railR, sy = g2.cy + Math.sin(A) * railR;
+  const rg1 = G.ringAt(1.0);
+  const T0x = rg1.x + Math.cos(A) * rg1.r, T0y = rg1.y + Math.sin(A) * rg1.r; // stick centered
+  const M = 5 * (1.0 - g2.hitZ) * rg1.r; // px of far-plane travel per stick unit
+  const lam = Math.hypot(T0x - sx, T0y - sy) / (Math.hypot(b.sx - sx, b.sy - sy) || 1);
+  const Tx = sx + (b.sx - sx) * lam, Ty = sy + (b.sy - sy) * lam;
+  G.setBeamAim((Tx - T0x) / M, (Ty - T0y) / M);
 }
 G.keys['ArrowUp'] = true;
 const hp0 = G.boss().hp;

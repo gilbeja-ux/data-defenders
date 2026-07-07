@@ -684,6 +684,35 @@ function spawnBoss() {
   buzz([30, 40, 60]);
   if (!progress.bossBriefed) { progress.bossBriefed = true; saveState(); showCard('boss'); }
 }
+// the beam is a straight screen-space ray: from the cannon toward where the
+// stick-deflected direction exits the tunnel (far end or wall). Hit testing
+// runs against this exact ray, so what you see is what you hit.
+function beamGeometry(g) {
+  const z0 = g.hitZ;
+  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
+  const A = nodes[0].angle;
+  const sx = g.cx + Math.cos(A) * railR, sy = g.cy + Math.sin(A) * railR;
+  const u0x = Math.cos(A), u0y = Math.sin(A);
+  let zExit = 1.0;
+  for (let z = z0 + 0.02; z < 1; z += 0.02) {
+    if (Math.hypot(u0x + beamAim.x * BEAM_S * (z - z0), u0y + beamAim.y * BEAM_S * (z - z0)) > 1.02) { zExit = z; break; }
+  }
+  const rg = ring(zExit, g);
+  const tx = rg.x + (u0x + beamAim.x * BEAM_S * (zExit - z0)) * rg.r;
+  const ty = rg.y + (u0y + beamAim.y * BEAM_S * (zExit - z0)) * rg.r;
+  return { sx, sy, tx, ty, zExit, endS: rg.s / ring(z0, g).s };
+}
+// distance/reach test of the core against the ray; null when clear
+function beamHitCore(g) {
+  const b = boss;
+  const seg = beamGeometry(g);
+  const dx = seg.tx - seg.sx, dy = seg.ty - seg.sy;
+  const len = Math.hypot(dx, dy) || 1;
+  const t = ((b.sx - seg.sx) * dx + (b.sy - seg.sy) * dy) / len;
+  const perp = Math.abs((-dy * (b.sx - seg.sx) + dx * (b.sy - seg.sy)) / len);
+  if (t > 0 && seg.zExit >= b.z - 0.03 && perp < b.sSize * 1.25) return { seg, t: Math.min(t, len) };
+  return null;
+}
 function updateBossFight(dt, g) {
   const b = boss;
   b.spin += dt * 2;
@@ -747,11 +776,8 @@ function updateBossFight(dt, g) {
     heat = Math.max(0, heat - dt / 2.5);
   }
   if (beamActive) {
-    // does the ray cross the core at its depth?
-    const dz = b.z - z0;
-    const bu = uv0x + beamAim.x * BEAM_S * dz;
-    const bv = uv0y + beamAim.y * BEAM_S * dz;
-    if (dz > 0.05 && Math.hypot(bu - b.u, bv - b.v) < 0.24) {
+    const hit = beamHitCore(g);
+    if (hit) {
       b.hp -= 16 * dt;
       b.hurtT = 0.15;
       if (Math.random() < 0.6) burst(b.sx + rand(-10, 10), b.sy + rand(-10, 10), '#d98cff', 2, 3);
@@ -1807,25 +1833,17 @@ function drawBoss(g) {
   ctx.beginPath(); ctx.arc(0, 0, size, 0, TAU); ctx.stroke();
   ctx.restore();
 }
-// the fused ray cannon: aim barrel + a true 3D beam converging into the tunnel
+// the fused ray cannon: aim barrel + a straight perspective-tapered beam
 function drawBeam(g) {
   const b = boss;
   if (!b || b.mergeT < 1) return;
-  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
-  const nx = g.cx + Math.cos(nodes[0].angle) * railR, ny = g.cy + Math.sin(nodes[0].angle) * railR;
+  const seg = beamGeometry(g);
   const size = Math.min(W, H) * 0.038;
-  const z0 = g.hitZ;
-  const uv0x = Math.cos(nodes[0].angle), uv0y = Math.sin(nodes[0].angle);
-  const uvAt = z => {
-    const rg = ring(z, g);
-    return { x: rg.x + (uv0x + beamAim.x * BEAM_S * (z - z0)) * rg.r, y: rg.y + (uv0y + beamAim.y * BEAM_S * (z - z0)) * rg.r, s: rg.s };
-  };
   const heatCol = heat < 0.5 ? '140,225,255' : heat < 0.8 ? '255,190,90' : '255,90,70';
-  // barrel tracks the beam's entry direction
-  const p1 = uvAt(z0 + 0.06);
-  const bAng = Math.atan2(p1.y - ny, p1.x - nx);
+  const bAng = Math.atan2(seg.ty - seg.sy, seg.tx - seg.sx);
+  // barrel tracks the ray
   ctx.save();
-  ctx.translate(nx, ny);
+  ctx.translate(seg.sx, seg.sy);
   ctx.rotate(bAng);
   ctx.fillStyle = '#0d1626';
   roundRect(0, -size * 0.24, size * 1.5, size * 0.48, 4); ctx.fill();
@@ -1835,41 +1853,45 @@ function drawBeam(g) {
   ctx.fillRect(size * 0.25, -size * 0.12, size * 1.1 * heat, size * 0.24); // heat window
   ctx.restore();
   if (!beamActive) return;
-  // where does the ray stop? the core, the tunnel wall, or the deep end
-  const dzB = b.z - z0;
-  const hitCore = dzB > 0.05 &&
-    Math.hypot(uv0x + beamAim.x * BEAM_S * dzB - b.u, uv0y + beamAim.y * BEAM_S * dzB - b.v) < 0.24;
-  let zEnd = 1.0;
-  if (hitCore) zEnd = b.z;
-  else {
-    for (let z = z0 + 0.02; z < 1; z += 0.02) {
-      const m = Math.hypot(uv0x + beamAim.x * BEAM_S * (z - z0), uv0y + beamAim.y * BEAM_S * (z - z0));
-      if (m > 1.02) { zEnd = z; break; }
-    }
+  // endpoint: the core when the ray connects, else the wall/deep exit
+  const hit = beamHitCore(g);
+  const dx = seg.tx - seg.sx, dy = seg.ty - seg.sy;
+  const len = Math.hypot(dx, dy) || 1;
+  let ex, ey, endScale;
+  if (hit) {
+    ex = seg.sx + dx / len * hit.t;
+    ey = seg.sy + dy / len * hit.t;
+    endScale = Math.max(0.15, ring(b.z, g).s / ring(g.hitZ, g).s);
+  } else {
+    ex = seg.tx; ey = seg.ty;
+    endScale = Math.max(0.12, seg.endS);
   }
-  const steps = 16, pts = [];
-  for (let i = 0; i <= steps; i++) pts.push(uvAt(z0 + (zEnd - z0) * i / steps));
+  const bx0 = seg.sx + Math.cos(bAng) * size * 1.4, by0 = seg.sy + Math.sin(bAng) * size * 1.4;
   const wob = Math.sin(time * 40) * 1.5;
   ctx.lineCap = 'round';
+  const SEGS = 10;
   for (const [wBase, col] of [[13 + wob, 'rgba(' + heatCol + ',0.30)'], [6, 'rgba(' + heatCol + ',0.7)'], [2.2, 'rgba(255,255,255,0.95)']]) {
     ctx.strokeStyle = col;
-    for (let i = 1; i <= steps; i++) {
-      ctx.lineWidth = Math.max(0.4, wBase * pts[i].s / pts[0].s);
-      ctx.beginPath(); ctx.moveTo(pts[i - 1].x, pts[i - 1].y); ctx.lineTo(pts[i].x, pts[i].y); ctx.stroke();
+    for (let i = 1; i <= SEGS; i++) {
+      const t0 = (i - 1) / SEGS, t1 = i / SEGS;
+      ctx.lineWidth = Math.max(0.4, wBase * lerp(1, endScale, (t0 + t1) / 2));
+      ctx.beginPath();
+      ctx.moveTo(lerp(bx0, ex, t0), lerp(by0, ey, t0));
+      ctx.lineTo(lerp(bx0, ex, t1), lerp(by0, ey, t1));
+      ctx.stroke();
     }
   }
-  const tip = pts[steps];
-  if (hitCore) { // impact bloom on the core
+  if (hit) { // impact bloom on the core
     const ig = ctx.createRadialGradient(b.sx, b.sy, 0, b.sx, b.sy, b.sSize * 1.5);
     ig.addColorStop(0, 'rgba(255,255,255,0.85)');
     ig.addColorStop(0.4, 'rgba(' + heatCol + ',0.5)');
     ig.addColorStop(1, 'rgba(' + heatCol + ',0)');
     ctx.fillStyle = ig;
     ctx.beginPath(); ctx.arc(b.sx, b.sy, b.sSize * 1.5, 0, TAU); ctx.fill();
-  } else if (zEnd < 0.99) { // scorch spark where the ray rakes the tunnel wall
+  } else if (seg.zExit < 0.99) { // scorch spark where the ray rakes the tunnel wall
     ctx.fillStyle = 'rgba(' + heatCol + ',0.7)';
-    ctx.beginPath(); ctx.arc(tip.x, tip.y, Math.max(2, 7 * tip.s), 0, TAU); ctx.fill();
-    if (Math.random() < 0.4) burst(tip.x, tip.y, '#ffd9a0', 1, 2);
+    ctx.beginPath(); ctx.arc(ex, ey, Math.max(2, 9 * endScale), 0, TAU); ctx.fill();
+    if (Math.random() < 0.4) burst(ex, ey, '#ffd9a0', 1, 2);
   }
 }
 
