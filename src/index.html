@@ -242,6 +242,8 @@ const sfx = {
   pick() { tone(660, 0.09, 'triangle', 0.12, 880); tone(1320, 0.14, 'triangle', 0.10, 1760); },
   slowDown() { tone(880, 0.50, 'sawtooth', 0.12, 180); tone(440, 0.65, 'triangle', 0.10, 110); },
   perfect() { tone(2093, 0.14, 'triangle', 0.13, 2637); tone(3136, 0.10, 'sine', 0.08, 3520); },
+  count() { tone(600, 0.12, 'square', 0.12, 560); },
+  go()    { tone(880, 0.20, 'square', 0.14, 1320); tone(1760, 0.30, 'triangle', 0.10, 2200); },
   speedUp()  { tone(180, 0.45, 'sawtooth', 0.11, 880); tone(110, 0.55, 'triangle', 0.09, 440); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
   win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
@@ -491,6 +493,8 @@ let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
 let hitStop = 0;              // brief slow-mo after a zap
+const INTRO_DUR = 3.7;        // ring formation + 3-2-1 countdown
+let introT = 999, introCd = -1;
 let tolVis = 1;               // eased hit-arc multiplier (wide-arc grows/shrinks smoothly)
 let bolts = [];               // lightning arcs (node → trap)
 const fx = { slow: 0, wide: 0, auto: 0 }; // power-up effect timers (seconds)
@@ -845,6 +849,8 @@ function resetRun() {
   score = 0; zaps = 0; misses = 0; combo = 0; perfects = 0; fragsHit = 0;
   enemies = []; particles = []; popups = []; bolts = []; pickups = [];
   boss = null; burstQ = null; patternQ = []; hitStop = 0;
+  introT = 0; introCd = -1;
+  for (const n of nodes) { n.formedFx = false; n.formAt = 0; }
   fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
   nodes[0].angle = Math.PI * 0.75;
   nodes[1].angle = Math.PI * 0.25;
@@ -933,6 +939,16 @@ function update(dt) {
   if (endless) LV = endlessCfg(levelT); // difficulty tracks survival time
   const L = LV;
 
+  // intro: the ring forms and the countdown runs before the stream goes live
+  introT += dt;
+  const inIntro = introT < INTRO_DUR;
+  const cdNow = introT < 0.7 ? -1 : introT < 1.7 ? 3 : introT < 2.7 ? 2 : inIntro ? 1 : 0;
+  if (cdNow !== introCd) {
+    introCd = cdNow;
+    if (cdNow > 0) sfx.count();
+    else if (cdNow === 0 && introT < INTRO_DUR + 1) sfx.go();
+  }
+
   // effect timers run on real time; hit-stop and slow-mo scale the game clock
   const wasSlow = fx.slow > 0;
   fx.slow = Math.max(0, fx.slow - dt);
@@ -943,7 +959,7 @@ function update(dt) {
   let sdt = dt;
   if (hitStop > 0) { hitStop = Math.max(0, hitStop - dt); sdt *= 0.12; }
   if (fx.slow > 0) sdt *= 0.55;
-  if (!tut) levelT += sdt;
+  if (!tut && !inIntro) levelT += sdt;
 
   // keyboard control (desktop testing) — controls always run at full speed
   const kSpd = 4.5 * dt;
@@ -952,8 +968,10 @@ function update(dt) {
   if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
   if (keys['ArrowRight']) nodes[1].angle += kSpd;
 
-  if (tut) updateTutorial(sdt);
-  else if (levelT < L.duration) trySpawn(sdt); // stop spawning once the run distance is covered
+  if (!inIntro) {
+    if (tut) updateTutorial(sdt);
+    else if (levelT < L.duration) trySpawn(sdt); // stop spawning once the run distance is covered
+  }
   if (burstQ) {
     burstQ.t -= sdt;
     if (burstQ.t <= 0) { spawnEnemy(); burstQ.left--; burstQ.t = 0.35; if (!burstQ.left) burstQ = null; }
@@ -962,7 +980,7 @@ function update(dt) {
     for (const q of patternQ) q.t -= dt;
     while (patternQ.length && patternQ[0].t <= 0) spawnEnemy(patternQ.shift().angle);
   }
-  pickupT -= sdt;
+  if (!inIntro) pickupT -= sdt;
   if (!tut && pickupT <= 0) { pickupT = rand(20, 32); if (!mutators.noPickups) spawnPickup(); }
 
   const g = geo();
@@ -1562,6 +1580,22 @@ function drawNodes(g) {
     const y = nearR.y + Math.sin(n.angle) * nearR.r;
     const size = Math.min(W, H) * 0.038;
     const cCol = i === 0 ? '111,227,255' : '255,255,255'; // left: Tron cyan, right: white
+    // intro: each carriage materializes when the forming ring reaches it
+    if (state === S.PLAY || state === S.PAUSE) {
+      const p2 = clamp(introT / 2.0, 0, 1);
+      const sw2 = (1 - Math.pow(1 - p2, 3)) * Math.PI;
+      if (sw2 < Math.PI - 0.001 && Math.abs(angDiff(n.angle, -Math.PI / 2)) > sw2) {
+        n.formAt = introT; n.prevA = n.angle;
+        continue;
+      }
+      if (!n.formedFx && introT < INTRO_DUR + 1) {
+        n.formedFx = true;
+        burst(x, y, i === 0 ? '#6fe3ff' : '#ffffff', 16, 4);
+      }
+    }
+    const formAge = introT - (n.formAt || 0);
+    const eb = t2 => 1 + 2.70158 * Math.pow(t2 - 1, 3) + 1.70158 * Math.pow(t2 - 1, 2); // easeOutBack
+    const fscale = formAge < 0.35 ? Math.max(0.01, eb(clamp(formAge / 0.35, 0, 1))) : 1;
     // lightcycle ribbon trail
     const vel = angDiff(n.angle, n.prevA === undefined ? n.angle : n.prevA);
     n.trailV = (n.trailV || 0) * 0.8 + vel * 0.2;
@@ -1604,6 +1638,7 @@ function drawNodes(g) {
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(n.angle); // +x = radially outward, +y = along the rail
+    ctx.scale(fscale, fscale); // pop-in overshoot during the intro
     const rh = size * 2.5, rw = size * 1.05;
     // grip struts reaching out onto the ring, with glowing contact pads
     ctx.fillStyle = '#0a1220';
@@ -1791,23 +1826,62 @@ function drawHUD(g) {
   const L = LV || LEVELS[levelIdx];
   const pad = 14;
 
-  // level intro title — fades out as the run begins (lingers longer when there's a threat hint)
-  const introDur = L.hint ? 3.6 : 2.4;
-  if (levelT < introDur && !tut) {
-    const a = levelT < introDur - 0.6 ? 1 : (introDur - levelT) / 0.6;
+  // level intro: title card + 3-2-1 countdown in the center while the ring forms
+  if (introT < INTRO_DUR + 0.5) {
+    const t = introT;
     ctx.textAlign = 'center';
-    ctx.globalAlpha = a;
-    try { ctx.letterSpacing = '5px'; } catch (e) {}
-    ctx.fillStyle = 'rgba(200,235,255,0.8)'; ctx.font = '600 12px system-ui';
-    ctx.fillText(endless ? 'SURVIVE' : 'LEVEL ' + (levelIdx + 1), W / 2, H * 0.16);
-    ctx.fillStyle = '#eafaff'; ctx.font = '800 ' + Math.min(W * 0.045, 26) + 'px system-ui';
-    ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 18;
-    ctx.fillText(L.name, W / 2, H * 0.16 + 30);
-    ctx.shadowBlur = 0;
-    try { ctx.letterSpacing = '0px'; } catch (e) {}
-    if (L.hint) {
-      ctx.fillStyle = '#ffb8c8'; ctx.font = '600 13px system-ui';
-      ctx.fillText(L.hint, W / 2, H * 0.16 + 54);
+    if (t < INTRO_DUR) {
+      const inA = clamp(t / 0.35, 0, 1);
+      const outA = clamp((INTRO_DUR - t) / 0.45, 0, 1);
+      const scale = 0.85 + 0.15 * (1 - Math.pow(1 - inA, 3));
+      ctx.save();
+      ctx.translate(W / 2, H * 0.30);
+      ctx.scale(scale, scale);
+      ctx.globalAlpha = Math.min(inA, outA);
+      try { ctx.letterSpacing = '6px'; } catch (e) {}
+      ctx.fillStyle = 'rgba(200,235,255,0.85)'; ctx.font = '600 13px system-ui';
+      ctx.fillText(endless ? 'SURVIVE' : 'LEVEL ' + (levelIdx + 1), 0, -34);
+      ctx.fillStyle = '#eafaff'; ctx.font = '800 ' + Math.min(W * 0.055, 32) + 'px system-ui';
+      ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 24;
+      ctx.fillText(L.name, 0, 0);
+      ctx.shadowBlur = 0;
+      try { ctx.letterSpacing = '0px'; } catch (e) {}
+      if (L.hint) {
+        ctx.fillStyle = '#ffb8c8'; ctx.font = '600 12px system-ui';
+        ctx.fillText(L.hint, 0, 26);
+      }
+      ctx.restore();
+      const cd = t - 0.7;
+      if (cd >= 0) { // 3 … 2 … 1, slamming in on the second
+        const idx = Math.min(Math.floor(cd), 2);
+        const ct = cd - idx;
+        const pop = 1.9 - 0.9 * Math.min(ct / 0.22, 1);
+        const ca = ct < 0.15 ? ct / 0.15 : clamp((1 - ct) / 0.35, 0, 1);
+        ctx.save();
+        ctx.translate(W / 2, H * 0.52);
+        ctx.scale(pop, pop);
+        ctx.globalAlpha = ca;
+        ctx.fillStyle = '#ffd24a';
+        ctx.font = '800 ' + Math.min(W * 0.09, 54) + 'px system-ui';
+        ctx.shadowColor = '#ffd24a'; ctx.shadowBlur = 26;
+        ctx.fillText(3 - idx, 0, 18);
+        ctx.shadowBlur = 0;
+        ctx.restore();
+      }
+    } else { // GO! flash as the stream goes live
+      const gt = (t - INTRO_DUR) / 0.5;
+      ctx.save();
+      ctx.translate(W / 2, H * 0.52);
+      ctx.scale(1 + gt * 0.6, 1 + gt * 0.6);
+      ctx.globalAlpha = 1 - gt;
+      ctx.fillStyle = '#7ee262';
+      ctx.font = '800 ' + Math.min(W * 0.09, 54) + 'px system-ui';
+      ctx.shadowColor = '#7ee262'; ctx.shadowBlur = 26;
+      try { ctx.letterSpacing = '4px'; } catch (e) {}
+      ctx.fillText('GO!', 0, 18);
+      try { ctx.letterSpacing = '0px'; } catch (e) {}
+      ctx.shadowBlur = 0;
+      ctx.restore();
     }
     ctx.globalAlpha = 1;
     ctx.textAlign = 'left';
@@ -2529,6 +2603,18 @@ function frame(now) {
 
   // node holder ring: thick matte black like the mock, with faked soft shadow for depth
   const bz = Math.min(W, H) * 0.055;
+  // during the level intro the ring sweeps into existence from the top
+  const ringP = (state === S.PLAY || state === S.PAUSE) ? clamp(introT / 2.0, 0, 1) : 1;
+  const ringSweep = (1 - Math.pow(1 - ringP, 3)) * Math.PI;
+  const ringForming = ringSweep < Math.PI - 0.001;
+  if (ringForming) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(g.cx, g.cy);
+    ctx.arc(g.cx, g.cy, g.nodeR * 2.2, -Math.PI / 2 - ringSweep, -Math.PI / 2 + ringSweep);
+    ctx.closePath();
+    ctx.clip();
+  }
   ctx.strokeStyle = 'rgba(0,0,0,0.10)'; ctx.lineWidth = bz * 3.0;
   ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR + bz / 2, 0, TAU); ctx.stroke();
   ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = bz * 2.2;
@@ -2548,6 +2634,21 @@ function frame(now) {
   ctx.strokeStyle = 'rgba(120,220,255,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
   ctx.beginPath(); ctx.arc(g.cx, g.cy, g.nodeR - bz * 1.1, 0, TAU);
   ctx.strokeStyle = 'rgba(120,220,255,0.20)'; ctx.lineWidth = 1; ctx.stroke();
+  if (ringForming) {
+    ctx.restore();
+    // white-hot formation heads racing along both directions
+    for (const s2 of [-1, 1]) {
+      const ha = -Math.PI / 2 + s2 * ringSweep;
+      const hx = g.cx + Math.cos(ha) * (g.nodeR + bz / 2), hy = g.cy + Math.sin(ha) * (g.nodeR + bz / 2);
+      const hg2 = ctx.createRadialGradient(hx, hy, 0, hx, hy, bz * 1.4);
+      hg2.addColorStop(0, 'rgba(235,250,255,0.95)');
+      hg2.addColorStop(0.4, 'rgba(120,220,255,0.5)');
+      hg2.addColorStop(1, 'rgba(120,220,255,0)');
+      ctx.fillStyle = hg2;
+      ctx.beginPath(); ctx.arc(hx, hy, bz * 1.4, 0, TAU); ctx.fill();
+      if (state === S.PLAY && Math.random() < 0.5) burst(hx, hy, '#bfeaff', 2, 2.5);
+    }
+  }
 
   // traps render over the ring — missed ones fly past the player and fade
   const sorted = enemies.slice().sort((a, b) => b.z - a.z);

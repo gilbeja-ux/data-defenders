@@ -94,10 +94,16 @@ code = code.replace("'use strict';", '') + `
   setMenuScroll: v => { menuScroll = v; }, tolVis: () => tolVis, musicRate: () => musicRate, dialCenter,
   detectBeat, beatQuantize, setBeat: (p, at) => { beatPeriod = p; musicStartAt = at; },
   patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
-  getPerfects: () => perfects, getScore: () => score
+  getPerfects: () => perfects, getScore: () => score,
+  getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT
 };`;
 eval(code);
 const G = globalThis.__g;
+// most tests exercise live gameplay — skip the level-intro countdown by default
+const rawStartLevel = G.startLevel;
+G.startLevel = i => { rawStartLevel(i); G.setIntro(999); };
+const rawStartEndless = G.startEndless;
+G.startEndless = () => { rawStartEndless(); G.setIntro(999); };
 
 let failures = 0;
 function check(name, cond) {
@@ -323,6 +329,20 @@ G.update(0.01); G.update(0.01);
 G.update(1.7); G.update(1.7);
 check('tutorial completes and persists', G.tut() === null && G.progress.tutorialDone === true);
 check('spawns held during tutorial', true);
+
+// ================= level intro =================
+rawStartLevel(1);
+check('intro clock arms on level start', G.getIntro() === 0);
+for (let i = 0; i < 30; i++) G.update(0.05); // 1.5s — mid-countdown
+check('spawns held during the intro', G.enemies().length === 0);
+check('level clock frozen during the intro', G.getLevelT() === 0);
+drawOk('mid-intro frame (forming ring + countdown)', () => {});
+for (let i = 0; i < 50; i++) G.update(0.05); // past 3.7s
+check('intro ends after the countdown', G.getIntro() > 3.7);
+let spawned = false;
+for (let i = 0; i < 80 && !spawned; i++) { G.update(0.05); spawned = G.enemies().length > 0; }
+check('the stream goes live after GO', spawned);
+check('nodes finished materializing', G.nodes[0].formedFx === true && G.nodes[1].formedFx === true);
 
 // ================= control scheme =================
 function pdown(id, x, y) { canvasHandlers.pointerdown({ pointerId: id, clientX: x, clientY: y, pointerType: 'touch' }); }
