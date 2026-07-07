@@ -270,6 +270,7 @@ const sfx = {
   overheatWarn() { tone(220, 0.5, 'sawtooth', 0.13, 90); tone(110, 0.6, 'square', 0.1, 60); },
   bossShot() { tone(140, 0.22, 'sawtooth', 0.13, 70); },
   go()    { tone(880, 0.20, 'square', 0.14, 1320); tone(1760, 0.30, 'triangle', 0.10, 2200); },
+  heal()  { tone(523, 0.14, 'triangle', 0.12, 659); tone(784, 0.22, 'triangle', 0.10, 1047); },
   speedUp()  { tone(180, 0.45, 'sawtooth', 0.11, 880); tone(110, 0.55, 'triangle', 0.09, 440); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
   win()  { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.22, 'triangle', 0.12), i * 130)); },
@@ -515,6 +516,7 @@ const S = { MENU: 0, PLAY: 1, END: 2, PAUSE: 3, INFO: 4 }; // INFO: frozen behin
 let state = S.MENU;
 let levelIdx = 0, levelT = 0, spawnT = 0;
 let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0, perfects = 0, fragsHit = 0;
+let comboHeal = 0; // zaps banked at max combo — every 5 knit back one integrity block
 let enemies = [], particles = [], popups = [];
 let shake = 0, redFlash = 0, tunnelScroll = 0, time = 0;
 let lowFX = false, perfAcc = 0, perfN = 0, perfWin = 0; // perf watchdog state
@@ -1077,7 +1079,7 @@ function resetRun() {
   if (!(progress.stars[LEVELS.length - 1] > 0)) mutators.oneLife = mutators.fast = mutators.noPickups = false;
   levelT = 0; spawnT = 1.2;
   integrity = mutators.oneLife ? 25 : 100;
-  score = 0; zaps = 0; misses = 0; combo = 0; perfects = 0; fragsHit = 0;
+  score = 0; zaps = 0; misses = 0; combo = 0; perfects = 0; fragsHit = 0; comboHeal = 0;
   enemies = []; particles = []; popups = []; bolts = []; pickups = [];
   boss = null; burstQ = null; patternQ = []; hitStop = 0;
   heat = 0; overheat = false; beamActive = false; beamSound(false, 0);
@@ -1163,7 +1165,7 @@ const INFO_CARDS = {
   heavy:  { title: 'HEAVY TRAP', lines: ['Armored — one node cannot break it.', 'Pin it with BOTH nodes at once.'] },
   line:   { title: 'BARRIER LINE', lines: ['Two traps linked by an energy wall.', 'Cover BOTH ENDS — one node on each.'] },
   lock:   { title: 'COLOR LOCK', lines: ['Keyed to a single node. Only the', 'MATCHING color can break it —', 'watch the orbiting dot.'] },
-  frag:   { title: 'FRIENDLY PACKET', lines: ['Green payload data. NOT a threat.', 'Do NOT zap it — let it pass', 'and collect the bonus.'] },
+  frag:   { title: 'FRIENDLY PACKET', lines: ['The BLACK packet is payload data.', 'NOT a threat — do NOT zap it.', 'Let it pass and collect the bonus.'] },
   pickup: { title: 'POWER-UP', lines: ['Golden relays ride the stream.', 'Catch one with any node:', 'SLOW-MO · WIDE ARC · AUTO-ZAP.'] },
   boss:   { title: 'FIREWALL CORE', lines: ['Your nodes fuse into a RAY CANNON.', 'LEFT thumb moves it. RIGHT stick aims', 'the beam INTO the tunnel — hold to fire.', 'Dodge the orbs. Watch the heat.'] }
 };
@@ -1347,13 +1349,13 @@ function update(dt) {
         const { x: fx2, y: fy } = ringXY(en.angle);
         if (touched) {
           en.dead = true;
-          burst(fx2, fy, '#7ee262', 22, 3.5);
+          burst(fx2, fy, '#4a5568', 22, 3.5);
           if (en.tut) { // practice: no penalty, try again
             if (tut) { tut.retry = en.tut; tut.t = 0; }
             popup(fx2, fy, 'THAT ONE WAS FRIENDLY — AGAIN', '#ff9a3c');
             sfx.miss();
           } else {
-            combo = 0; fragsHit++;
+            combo = 0; comboHeal = 0; fragsHit++;
             integrity = Math.max(0, integrity - 25);
             popup(fx2, fy, 'FRIENDLY PACKET DESTROYED', '#ff4a5e');
             redFlash = 1; shake = Math.min(shake + 0.6, 1);
@@ -1364,7 +1366,7 @@ function update(dt) {
           en.resolved = true;
           const bonus = Math.round(50 * mutMul());
           score += bonus;
-          popup(fx2, fy, 'packet safe +' + bonus, '#7ee262');
+          popup(fx2, fy, 'packet safe +' + bonus, '#9aa7bd');
         }
         continue;
       }
@@ -1404,6 +1406,19 @@ function update(dt) {
         const base = en.type === 'heavy' ? 250 : en.type === 'line' ? 300 : en.lock !== undefined ? 150 : 100;
         const pts = Math.round(base * (perfect ? 2 : 1) * mutMul()) * Math.min(combo, 5);
         score += pts; zaps++;
+        // max-combo streaks knit the payload back together
+        const cap = mutators.oneLife ? 25 : 100;
+        if (combo >= 5 && integrity < cap) {
+          comboHeal++;
+          if (comboHeal >= 5) {
+            comboHeal = 0;
+            integrity = Math.min(cap, integrity + 25);
+            popup(ex, ey - 26, 'INTEGRITY RESTORED', '#8fc7ff');
+            rimFX.push({ a: en.angle, t: 0.6, col: '143,199,255' });
+            sfx.heal();
+            buzz(12);
+          }
+        }
         burst(ex, ey, '#bfeaff', 26, 4);
         burst(ex, ey, '#ffffff', 14, 5);
         if (en.partner) {
@@ -1438,7 +1453,7 @@ function update(dt) {
         if (en.tut) {
           if (tut) { tut.retry = en.tut; tut.t = 0; } // practice trap: no penalty, try again
         } else {
-          misses++; combo = 0;
+          misses++; combo = 0; comboHeal = 0;
           integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
           burst(ex, ey, '#ff4a5e', 20, 3);
           popup(ex, ey, 'DATA STOLEN', '#ff4a5e');
@@ -1592,9 +1607,9 @@ function drawEnemy(en, g) {
   if (en.resolved) size *= 1 + (1 - clamp(en.z / g.hitZ, 0, 1)) * 1.6;
   // iridescent palettes — like the sprite: rich, varied facets, tinted hostile red/orange
   const PAL = en.type === 'frag'
-    ? { glow: '110,230,120', tendril: '#1c5a2a', tendrilHi: '#a0f0b0',
-        shades: ['#57c95f', '#2f9e46', '#8fe08a', '#1f7a35', '#6fdc74'],
-        lights: ['#c8f7c0', '#e8ffe2', '#a0f0b0'] }
+    ? { glow: '90,110,140', tendril: '#151a26', tendrilHi: '#3a4354',
+        shades: ['#2b3242', '#151a26', '#3a4354', '#0d1119', '#232a38'],
+        lights: ['#4a5568', '#5a6a80', '#3a4354'] }
     : en.type === 'heavy'
     ? { glow: '200,70,255', tendril: '#4a1060', tendrilHi: '#d98cff',
         shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'],
@@ -1680,12 +1695,12 @@ function drawEnemy(en, g) {
     ctx.quadraticCurveTo(-pr * 0.55, -pr * 0.55, 0, -pr);
     ctx.closePath();
     const fg = ctx.createRadialGradient(-pr * 0.2, -pr * 0.25, 0, 0, 0, pr);
-    fg.addColorStop(0, '#e8ffe2');
-    fg.addColorStop(0.45, '#57c95f');
-    fg.addColorStop(1, '#1f7a35');
+    fg.addColorStop(0, '#2b3242');
+    fg.addColorStop(0.45, '#0d1119');
+    fg.addColorStop(1, '#02040a');
     ctx.fillStyle = fg; ctx.fill();
-    ctx.strokeStyle = 'rgba(200,255,200,0.75)'; ctx.lineWidth = Math.max(1, pr * 0.08); ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.strokeStyle = 'rgba(140,150,170,0.55)'; ctx.lineWidth = Math.max(1, pr * 0.08); ctx.stroke();
+    ctx.fillStyle = 'rgba(200,210,230,0.35)';
     ctx.beginPath(); ctx.ellipse(-pr * 0.22, -pr * 0.28, pr * 0.16, pr * 0.09, -0.6, 0, TAU); ctx.fill();
     ctx.restore();
   } else if (en.lock !== undefined) {
@@ -1792,7 +1807,7 @@ function drawArrivalPings(g) {
   };
   for (const en of enemies) {
     if (en.dead || en.resolved) continue;
-    const col = en.type === 'frag' ? '110,230,120'
+    const col = en.type === 'frag' ? '140,150,170'
       : en.type === 'heavy' ? '200,70,255'
       : en.lock === 0 ? '80,170,255'
       : en.lock === 1 ? '240,248,255'
@@ -2202,7 +2217,7 @@ function drawDials() {
         ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(p2.x, p2.y); ctx.stroke();
       }
       ctx.fillStyle = en.type === 'frag'
-        ? `rgba(110,230,120,${al})`
+        ? `rgba(140,150,170,${al})`
         : en.type === 'heavy'
         ? `rgba(200,80,255,${al})`
         : en.lock === 0
@@ -2545,7 +2560,7 @@ const INFO_PAL = {
   normal: { glow: '255,60,90',   shades: ['#e8274b', '#ff5a3c', '#d81f6e', '#b3123a', '#ff8c5a'], core: '#ff5a3c' },
   heavy:  { glow: '200,70,255',  shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'], core: '#b03ae8' },
   lock:   { glow: '80,170,255',  shades: ['#2f7fe0', '#1c4fae', '#4d9bff', '#12398a', '#3f8af0'], core: '#2f7fe0' },
-  frag:   { glow: '110,230,120', shades: ['#57c95f', '#2f9e46', '#8fe08a', '#1f7a35', '#6fdc74'], core: '#57c95f' }
+  frag:   { glow: '90,110,140', shades: ['#2b3242', '#151a26', '#3a4354', '#0d1119', '#232a38'], core: '#2b3242' }
 };
 function drawInfoGlyph(kind, cx, cy, r) {
   ctx.save();
@@ -2582,6 +2597,29 @@ function drawInfoGlyph(kind, cx, cy, r) {
     ctx.moveTo(s2 * 0.3, -s2); ctx.lineTo(-s2 * 0.45, s2 * 0.15); ctx.lineTo(0, s2 * 0.15);
     ctx.lineTo(-s2 * 0.3, s2); ctx.lineTo(s2 * 0.45, -0.15 * s2); ctx.lineTo(0, -0.15 * s2);
     ctx.closePath(); ctx.fill();
+  } else if (kind === 'frag') {
+    const pr = r * 1.05;
+    const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, pr * 1.8);
+    gl.addColorStop(0, 'rgba(90,110,140,0.4)');
+    gl.addColorStop(1, 'rgba(90,110,140,0)');
+    ctx.fillStyle = gl;
+    ctx.beginPath(); ctx.arc(0, 0, pr * 1.8, 0, TAU); ctx.fill();
+    ctx.rotate(time * 0.25);
+    ctx.beginPath();
+    ctx.moveTo(0, -pr);
+    ctx.quadraticCurveTo(pr * 0.55, -pr * 0.55, pr, 0);
+    ctx.quadraticCurveTo(pr * 0.55, pr * 0.55, 0, pr);
+    ctx.quadraticCurveTo(-pr * 0.55, pr * 0.55, -pr, 0);
+    ctx.quadraticCurveTo(-pr * 0.55, -pr * 0.55, 0, -pr);
+    ctx.closePath();
+    const fg2 = ctx.createRadialGradient(-pr * 0.2, -pr * 0.25, 0, 0, 0, pr);
+    fg2.addColorStop(0, '#2b3242');
+    fg2.addColorStop(0.45, '#0d1119');
+    fg2.addColorStop(1, '#02040a');
+    ctx.fillStyle = fg2; ctx.fill();
+    ctx.strokeStyle = 'rgba(140,150,170,0.55)'; ctx.lineWidth = Math.max(1.5, pr * 0.08); ctx.stroke();
+    ctx.fillStyle = 'rgba(200,210,230,0.35)';
+    ctx.beginPath(); ctx.ellipse(-pr * 0.22, -pr * 0.28, pr * 0.16, pr * 0.09, -0.6, 0, TAU); ctx.fill();
   } else if (kind === 'line') {
     const off = r * 1.05;
     ctx.lineCap = 'round';

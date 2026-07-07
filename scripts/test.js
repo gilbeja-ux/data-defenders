@@ -289,6 +289,35 @@ G.update(0.01);
 check('catching a pickup arms its effect', G.fx.auto > 4);
 G.fx.auto = 0;
 
+// ================= max-combo regeneration =================
+G.startLevel(1);
+G.enemies().length = 0;
+G.setIntegrity(50);
+function streakZap() {
+  const zEn = G.spawnEnemy(0.6, 'normal');
+  aim(0, 0.6); aim(1, 0.6 + Math.PI);
+  cross(zEn);
+  return zEn.dead;
+}
+let okZaps = true;
+for (let i = 0; i < 9; i++) okZaps = streakZap() && okZaps; // combo 5 reached at #5; heal banks 5..9
+check('nine-zap streak restores one integrity block', okZaps && G.stats().integrity === 75);
+for (let i = 0; i < 5; i++) streakZap();
+check('streak keeps healing until the bar is full', G.stats().integrity === 100);
+for (let i = 0; i < 5; i++) streakZap();
+check('full bar stays capped at 100', G.stats().integrity === 100);
+// combo break resets the bank
+G.setIntegrity(50);
+for (let i = 0; i < 4; i++) streakZap(); // combo 5..8: banks 4
+en = G.spawnEnemy(2.8, 'normal');
+aim(0, 0); aim(1, 0.5); // let it slip — combo breaks
+cross(en);
+check('a miss resets the heal bank', G.stats().integrity === 25 && G.stats().combo === 0);
+for (let i = 0; i < 8; i++) streakZap(); // combo 1..8 → banks 4 (from combo 5)
+check('bank restarts from zero after the break', G.stats().integrity === 25);
+streakZap(); // 5th banked zap
+check('heal lands on the fifth banked zap', G.stats().integrity === 50);
+
 // ================= endless config ramp =================
 const c0 = G.endlessCfg(0), c200 = G.endlessCfg(200);
 check('endless difficulty ramps with time', c200.speed > c0.speed && c200.spawnMin < c0.spawnMin && c200.heavies > 0 && c0.heavies === 0);
