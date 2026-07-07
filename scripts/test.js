@@ -95,7 +95,8 @@ code = code.replace("'use strict';", '') + `
   detectBeat, beatQuantize, setBeat: (p, at) => { beatPeriod = p; musicStartAt = at; },
   patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
   getPerfects: () => perfects, getScore: () => score,
-  getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT
+  getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
+  startQualification, getInfoCard: () => infoCard, isQual: () => qual
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -104,6 +105,8 @@ const rawStartLevel = G.startLevel;
 G.startLevel = i => { rawStartLevel(i); G.setIntro(999); };
 const rawStartEndless = G.startEndless;
 G.startEndless = () => { rawStartEndless(); G.setIntro(999); };
+const rawStartQual = G.startQualification;
+G.startQualification = () => { rawStartQual(); G.setIntro(999); };
 
 let failures = 0;
 function check(name, cond) {
@@ -302,33 +305,77 @@ G.setIntegrity(0);
 G.update(0.01);
 check('endless defeat records the best score', G.getState() === G.S.END && G.progress.best === 1234);
 
-// ================= tutorial =================
+// ================= qualification =================
 G.progress.tutorialDone = false;
-G.startLevel(0);
-check('tutorial armed on the first run of level 1', !!G.tut());
-G.update(1.1);
-const tp1 = G.enemies().find(e => e.tut === 'L');
-check('tutorial spawns a slow left-side practice trap', !!tp1 && tp1.speedMul < 0.5);
-tp1.z = G.geo().hitZ;
-aim(0, tp1.angle + 1.5); aim(1, tp1.angle - 1.5); // miss it
-G.update(0.01);
-check('missed practice trap costs nothing', G.stats().integrity === 100 && G.stats().misses === 0);
-G.update(1.0);
-const tp2 = G.enemies().find(e => e.tut && !e.resolved && !e.dead);
-check('practice trap respawns after a miss', !!tp2);
-tp2.z = G.geo().hitZ;
-aim(0, tp2.angle);
-G.update(0.01); G.update(0.01);
-check('tutorial advances after the first zap', G.tut().step >= 2);
-G.update(1.3); G.update(1.3);
-const tp3 = G.enemies().find(e => e.tut === 'R' && !e.dead && !e.resolved);
-check('right-thumb practice trap spawns', !!tp3);
-tp3.z = G.geo().hitZ;
-aim(1, tp3.angle);
-G.update(0.01); G.update(0.01);
-G.update(1.7); G.update(1.7);
-check('tutorial completes and persists', G.tut() === null && G.progress.tutorialDone === true);
-check('spawns held during tutorial', true);
+G.startQualification();
+G.update(0.05);
+check('qualification opens with the movement briefing', G.getState() === G.S.INFO && G.getInfoCard() === 'move' && G.isQual());
+function dismiss() { G.update(0.5); canvasHandlers.pointerdown({ pointerId: 7, clientX: 5, clientY: 5, pointerType: 'touch' }); }
+function settle() { for (let i = 0; i < 4; i++) G.update(0.4); }
+function waitLive(maxS) {
+  for (let i = 0; i < maxS / 0.05; i++) {
+    if (G.enemies().some(e => e.tut && !e.dead && !e.resolved) || G.pickups().some(p => p.tut && !p.done)) return true;
+    G.update(0.05);
+  }
+  return false;
+}
+function zapPractice() {
+  const pen = G.enemies().find(e => e.tut && !e.dead && !e.resolved);
+  if (!pen) return false;
+  if (pen.type === 'heavy') { aim(0, pen.angle + 0.05); aim(1, pen.angle - 0.05); }
+  else if (pen.type === 'line') { aim(0, pen.angle); aim(1, pen.partner.angle); }
+  else if (pen.lock !== undefined) { aim(pen.lock, pen.angle); aim(1 - pen.lock, pen.angle + Math.PI); }
+  else { aim(0, pen.angle); aim(1, pen.angle + Math.PI); }
+  cross(pen);
+  return pen.dead === true;
+}
+dismiss();
+check('tap dismisses the briefing', G.getState() === G.S.PLAY);
+for (let i = 1; i <= 14 && G.getState() === G.S.PLAY; i++) { aim(0, i * 0.25); aim(1, -i * 0.25); G.update(0.05); }
+check('thumb travel completes movement training', G.getState() === G.S.INFO && G.getInfoCard() === 'normal');
+dismiss();
+check('practice trap 1 spawns and dies', waitLive(4) && zapPractice());
+check('practice trap 2 spawns and dies', waitLive(4) && zapPractice());
+settle();
+check('heavy briefing appears', G.getState() === G.S.INFO && G.getInfoCard() === 'heavy');
+dismiss();
+check('heavy practice: pinned by both nodes', waitLive(4) && zapPractice());
+settle();
+check('barrier briefing appears', G.getState() === G.S.INFO && G.getInfoCard() === 'line');
+dismiss();
+check('barrier practice: node per end', waitLive(4) && zapPractice());
+settle();
+check('color-lock briefing appears', G.getState() === G.S.INFO && G.getInfoCard() === 'lock');
+dismiss();
+check('blue-lock practice', waitLive(4) && zapPractice());
+check('white-lock practice', waitLive(4) && zapPractice());
+settle();
+check('friendly-packet briefing appears', G.getState() === G.S.INFO && G.getInfoCard() === 'frag');
+dismiss();
+waitLive(4);
+{
+  const pen = G.enemies().find(e => e.tut && !e.dead && !e.resolved);
+  aim(0, pen.angle + 1.5); aim(1, pen.angle - 1.5);
+  cross(pen);
+  check('letting the packet pass succeeds', pen.resolved === true && !pen.dead);
+}
+settle();
+check('power-up briefing appears', G.getState() === G.S.INFO && G.getInfoCard() === 'pickup');
+dismiss();
+waitLive(4);
+{
+  const pp = G.pickups().find(p2 => p2.tut && !p2.done);
+  pp.z = G.geo().hitZ; aim(0, pp.angle);
+  G.update(0.01);
+  check('catching the practice relay works', G.fx.wide > 0);
+  G.fx.wide = 0;
+}
+settle(); settle();
+check('QUALIFIED: victory screen + progress persisted', G.getState() === G.S.END && G.getEndWin() === true && G.progress.tutorialDone === true && G.tut() === null);
+drawOk('qualification end screen', () => {});
+drawOk('briefing card frame', () => { G.progress.tutorialDone = false; G.startQualification(); G.update(0.05); });
+G.setState(G.S.MENU);
+G.progress.tutorialDone = true;
 
 // ================= level intro =================
 rawStartLevel(1);

@@ -100,7 +100,7 @@ function audio() {
   initAC();
   if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
   // (re)start the right track — every audio() call originates from a user gesture
-  playTrack(state === S.PLAY || state === S.PAUSE ? runTrack : 'menu');
+  playTrack(state === S.PLAY || state === S.PAUSE || state === S.INFO ? runTrack : 'menu');
   return AC;
 }
 function tone(freq, dur, type, vol, slideTo, dest) {
@@ -485,7 +485,7 @@ function saveState() {
 })();
 
 // ---------- game state ----------
-const S = { MENU: 0, PLAY: 1, END: 2, PAUSE: 3 };
+const S = { MENU: 0, PLAY: 1, END: 2, PAUSE: 3, INFO: 4 }; // INFO: frozen behind a briefing card
 let state = S.MENU;
 let levelIdx = 0, levelT = 0, spawnT = 0;
 let integrity = 100, score = 0, zaps = 0, misses = 0, combo = 0, perfects = 0, fragsHit = 0;
@@ -503,7 +503,8 @@ let tut = null;               // tutorial controller (level 1, first run)
 let boss = null;              // firewall core (levels with boss: true)
 let burstQ = null;            // pending burst-volley spawns
 let patternQ = [];            // beat-choreographed volley schedule
-let endless = false, LV = null, runTrack = 0; // active run config + its soundtrack
+let endless = false, qual = false, LV = null, runTrack = 0; // active run config + its soundtrack
+let infoCard = null, infoShownAt = 0; // briefing card (S.INFO)
 let menuScroll = 0, menuPtr = null; // level-list scrolling
 let endWin = false, endStars = 0, endT = 0, endNewBest = false;
 let pauseBtnRect = null, pauseButtonsList = [], pauseSlidersList = [], pauseTogglesList = [];
@@ -709,6 +710,10 @@ canvas.addEventListener('pointerdown', e => {
   audio();
   if (e.pointerType === 'touch') tryLockLandscape();
   const P = evPos(e);
+  if (state === S.INFO) {
+    if (time - infoShownAt > 0.35) { state = S.PLAY; sfx.tick(); }
+    return;
+  }
   if (state === S.MENU) {
     // overlay + gear act immediately; the level list uses tap-vs-drag on release
     const hitRect = (r, m) => r && P.x > r.x - m && P.x < r.x + r.w + m && P.y > r.y - m && P.y < r.y + r.h + m;
@@ -823,7 +828,7 @@ function menuTap(x, y, pid) {
   }
   for (const b of menuButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h && !b.locked) {
-      if (b.endless) startEndless(); else startLevel(b.level);
+      if (b.endless) startEndless(); else if (b.qual) startQualification(); else startLevel(b.level);
       sfx.tick(); return;
     }
   }
@@ -833,7 +838,7 @@ function endTap(x, y) {
   for (const b of endButtons) {
     if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
       sfx.tick();
-      if (b.action === 'retry') { if (endless) startEndless(); else startLevel(levelIdx); }
+      if (b.action === 'retry') { if (endless) startEndless(); else if (qual) startQualification(); else startLevel(levelIdx); }
       else if (b.action === 'next') startLevel(levelIdx + 1);
       else { state = S.MENU; playTrack('menu'); }
       return;
@@ -857,14 +862,25 @@ function resetRun() {
   state = S.PLAY;
 }
 function startLevel(i) {
-  levelIdx = i; endless = false; LV = LEVELS[i];
-  tut = (i === 0 && !progress.tutorialDone) ? { step: 0, t: 0, respawn: null } : null;
+  levelIdx = i; endless = false; qual = false; LV = LEVELS[i];
+  tut = null;
   resetRun();
   runTrack = LV.track || 0;
   playTrack(runTrack);
 }
+// QUALIFICATION: the training run — movement, every enemy type, one power-up
+function startQualification() {
+  levelIdx = -1; endless = false; qual = true;
+  LV = { name: 'QUALIFICATION', duration: Infinity, spawnMin: 9, spawnMax: 9, speed: 0.30,
+         doubles: 0, crawlers: 0, heavies: 0, lines: 0, colors: 0, frags: 0 };
+  tut = { stage: -1, t: 0, queue: [], moved: [0, 0], lastA: [0, 0], retry: null, spawned: null };
+  resetRun();
+  tut.lastA = [nodes[0].angle, nodes[1].angle];
+  runTrack = (Math.random() * 3) | 0;
+  playTrack(runTrack);
+}
 function startEndless() {
-  levelIdx = -1; endless = true; LV = endlessCfg(0); tut = null;
+  levelIdx = -1; endless = true; qual = false; LV = endlessCfg(0); tut = null;
   resetRun();
   runTrack = (Math.random() * 3) | 0;
   playTrack(runTrack);
@@ -872,8 +888,10 @@ function startEndless() {
 
 function endLevel(win) {
   endWin = win; endT = 0;
-  endStars = win && !endless ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
-  if (endless) {
+  endStars = win && !endless && !qual ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
+  if (qual) {
+    sfx.win();
+  } else if (endless) {
     progress.best = Math.max(progress.best || 0, score);
     saveState();
     sfx.fail();
@@ -892,31 +910,87 @@ function endLevel(win) {
 function spawnBolt(x1, y1, x2, y2) {
   bolts.push({ x1, y1, x2, y2, life: 0.18, max: 0.18 });
 }
-// guided first run: one slow trap per thumb, no penalties, spawns held until done
-function updateTutorial(dt) {
-  tut.t += dt;
-  const alive = enemies.some(e => !e.dead && !e.resolved);
-  if (tut.respawn && !alive && tut.t > 0.8) { // missed the practice trap — try again
-    const side = tut.respawn; tut.respawn = null; tut.t = 0;
-    const en = spawnEnemy(side === 'L' ? Math.PI + rand(-0.4, 0.4) : rand(-0.4, 0.4), 'normal');
-    en.speedMul = 0.42; en.tut = side;
+// ---------- qualification curriculum ----------
+const QUAL = [
+  { card: 'move' },
+  { card: 'normal', queue: ['normal', 'normal'] },
+  { card: 'heavy',  queue: ['heavy'] },
+  { card: 'line',   queue: ['line'] },
+  { card: 'lock',   queue: ['lock0', 'lock1'] },
+  { card: 'frag',   queue: ['frag'] },
+  { card: 'pickup', queue: ['pickup'] }
+];
+const INFO_CARDS = {
+  move:   { title: 'DUAL NODES', lines: ['Left thumb steers the BLUE node,', 'right thumb steers the WHITE node.', 'Slide around the dials to ride the ring.'] },
+  normal: { title: 'DATA TRAP', lines: ['Hostile packet riding the stream.', 'Align ANY node with it as it reaches', 'the ring. Dead-center = PERFECT ×2.'] },
+  heavy:  { title: 'HEAVY TRAP', lines: ['Armored — one node cannot break it.', 'Pin it with BOTH nodes at once.'] },
+  line:   { title: 'BARRIER LINE', lines: ['Two traps linked by an energy wall.', 'Cover BOTH ENDS — one node on each.'] },
+  lock:   { title: 'COLOR LOCK', lines: ['Keyed to a single node. Only the', 'MATCHING color can break it —', 'watch the orbiting dot.'] },
+  frag:   { title: 'FRIENDLY PACKET', lines: ['Green payload data. NOT a threat.', 'Do NOT zap it — let it pass', 'and collect the bonus.'] },
+  pickup: { title: 'POWER-UP', lines: ['Golden relays ride the stream.', 'Catch one with any node:', 'SLOW-MO · WIDE ARC · AUTO-ZAP.'] }
+};
+function showCard(key) {
+  infoCard = key; infoShownAt = time;
+  state = S.INFO;
+  sfx.tick();
+}
+function qualSpawn(kind) {
+  tut.spawned = kind;
+  if (kind === 'pickup') {
+    pickups.push({ kind: 'wide', z: 1.12, angle: Math.random() * TAU, spin: 0, done: false, tut: true });
     return;
   }
-  if (tut.step === 0 && tut.t > 1.0) {
-    const en = spawnEnemy(Math.PI + rand(-0.4, 0.4), 'normal'); // left side
-    en.speedMul = 0.42; en.tut = 'L';
-    tut.step = 1; tut.t = 0;
-  } else if (tut.step === 1 && !alive && !tut.respawn) {
-    tut.step = 2; tut.t = 0;
-  } else if (tut.step === 2 && tut.t > 1.2) {
-    const en = spawnEnemy(rand(-0.4, 0.4), 'normal'); // right side
-    en.speedMul = 0.42; en.tut = 'R';
-    tut.step = 3; tut.t = 0;
-  } else if (tut.step === 3 && !alive && !tut.respawn) {
-    tut.step = 4; tut.t = 0;
-  } else if (tut.step === 4 && tut.t > 1.6) {
-    progress.tutorialDone = true; saveState();
+  if (kind === 'line') {
+    const a = Math.random() * TAU, gap = rand(0.9, 1.3);
+    const e1 = spawnEnemy(a, 'line'), e2 = spawnEnemy(a + gap, 'line');
+    e1.partner = e2; e2.partner = e1; e1.lineLead = true;
+    e1.tut = e2.tut = 'line';
+    e1.speedMul = e2.speedMul = 0.5;
+    return;
+  }
+  let en;
+  if (kind === 'lock0' || kind === 'lock1') {
+    en = spawnEnemy(undefined, 'normal');
+    en.lock = kind === 'lock0' ? 0 : 1;
+  } else en = spawnEnemy(undefined, kind); // normal | heavy | frag
+  en.tut = kind;
+  en.speedMul = kind === 'heavy' ? 0.45 : 0.5;
+  en.drift = 0;
+}
+function advanceQual() {
+  tut.stage++;
+  tut.t = 0;
+  if (tut.stage >= QUAL.length) { // qualified!
+    progress.tutorialDone = true;
+    saveState();
     tut = null;
+    endLevel(true);
+    return;
+  }
+  showCard(QUAL[tut.stage].card);
+  tut.queue = (QUAL[tut.stage].queue || []).slice();
+}
+function updateTutorial(dt) {
+  tut.t += dt;
+  for (let i = 0; i < 2; i++) { // cumulative thumb travel for the movement stage
+    tut.moved[i] += Math.abs(angDiff(nodes[i].angle, tut.lastA[i]));
+    tut.lastA[i] = nodes[i].angle;
+  }
+  if (tut.stage === -1) { tut.stage = 0; showCard(QUAL[0].card); return; }
+  const st = QUAL[tut.stage];
+  if (st.card === 'move') {
+    if (tut.moved[0] > 1.2 && tut.moved[1] > 1.2) advanceQual();
+    return;
+  }
+  const live = enemies.some(e => !e.dead && !e.resolved) || pickups.some(p => !p.done);
+  if (tut.retry && !live && tut.t > 0.9) { // practice failed — same drill again
+    const k = tut.retry; tut.retry = null; tut.t = 0;
+    qualSpawn(k);
+    return;
+  }
+  if (!live && !tut.retry) {
+    if (tut.queue.length) { if (tut.t > 0.7) { tut.t = 0; qualSpawn(tut.queue.shift()); } }
+    else if (tut.t > 0.8) advanceQual();
   }
 }
 function update(dt) {
@@ -1024,13 +1098,19 @@ function update(dt) {
         const { x: fx2, y: fy } = ringXY(en.angle);
         if (touched) {
           en.dead = true;
-          combo = 0; fragsHit++;
-          integrity = Math.max(0, integrity - 25);
           burst(fx2, fy, '#7ee262', 22, 3.5);
-          popup(fx2, fy, 'FRIENDLY PACKET DESTROYED', '#ff4a5e');
-          redFlash = 1; shake = Math.min(shake + 0.6, 1);
-          sfx.miss();
-          buzz([40, 40, 60]);
+          if (en.tut) { // practice: no penalty, try again
+            if (tut) { tut.retry = en.tut; tut.t = 0; }
+            popup(fx2, fy, 'THAT ONE WAS FRIENDLY — AGAIN', '#ff9a3c');
+            sfx.miss();
+          } else {
+            combo = 0; fragsHit++;
+            integrity = Math.max(0, integrity - 25);
+            popup(fx2, fy, 'FRIENDLY PACKET DESTROYED', '#ff4a5e');
+            redFlash = 1; shake = Math.min(shake + 0.6, 1);
+            sfx.miss();
+            buzz([40, 40, 60]);
+          }
         } else {
           en.resolved = true;
           const bonus = Math.round(50 * mutMul());
@@ -1097,7 +1177,7 @@ function update(dt) {
         en.resolved = true; // slips past the ring and flies by the player
         if (en.partner) en.partner.resolved = true; // the pair fails as one
         if (en.tut) {
-          if (tut) { tut.respawn = en.tut; tut.t = 0; } // practice trap: no penalty, try again
+          if (tut) { tut.retry = en.tut; tut.t = 0; } // practice trap: no penalty, try again
         } else {
           misses++; combo = 0;
           integrity = Math.max(0, integrity - 25); // 4 mistakes = corrupted payload
@@ -1118,6 +1198,9 @@ function update(dt) {
     p.spin += dt * 2;
     if (!p.done && p.z <= g.hitZ) {
       p.done = true;
+      if (p.tut && tut && !(covers(nodes[0], p.angle) || covers(nodes[1], p.angle))) {
+        tut.retry = 'pickup'; tut.t = 0; // missed the practice relay — again
+      }
       if (covers(nodes[0], p.angle) || covers(nodes[1], p.angle)) {
         p.dead = true;
         fx[p.kind] = PICKUPS[p.kind].dur;
@@ -1840,7 +1923,7 @@ function drawHUD(g) {
       ctx.globalAlpha = Math.min(inA, outA);
       try { ctx.letterSpacing = '6px'; } catch (e) {}
       ctx.fillStyle = 'rgba(200,235,255,0.85)'; ctx.font = '600 13px system-ui';
-      ctx.fillText(endless ? 'SURVIVE' : 'LEVEL ' + (levelIdx + 1), 0, -34);
+      ctx.fillText(endless ? 'SURVIVE' : qual ? 'TRAINING' : 'LEVEL ' + (levelIdx + 1), 0, -34);
       ctx.fillStyle = '#eafaff'; ctx.font = '800 ' + Math.min(W * 0.055, 32) + 'px system-ui';
       ctx.shadowColor = '#5fd7ff'; ctx.shadowBlur = 24;
       ctx.fillText(L.name, 0, 0);
@@ -1967,14 +2050,19 @@ function drawHUD(g) {
     ctx.fillRect(x0, y0 + chh + 3, cw * clamp(fx[k] / PICKUPS[k].dur, 0, 1), 2);
   });
 
-  // tutorial prompts + guides
-  if (tut) {
-    const ten = enemies.find(e => e.tut && !e.dead && !e.resolved);
+  // qualification prompts + guides
+  if (tut && tut.stage >= 0) {
+    const st = QUAL[tut.stage];
+    const nn = a => Math.abs(angDiff(nodes[0].angle, a)) < Math.abs(angDiff(nodes[1].angle, a)) ? nodes[0] : nodes[1];
     let msg = null;
-    if (tut.step <= 1) msg = 'Slide your LEFT thumb — align the BLUE node with the trap';
-    else if (tut.step === 2) msg = 'NICE!  Missed traps corrupt the payload';
-    else if (tut.step === 3) msg = 'Now your RIGHT thumb — align the WHITE node';
-    else if (tut.step === 4) msg = "You're ready — defend the payload!";
+    if (st.card === 'move') msg = 'Slide BOTH thumbs around the dials';
+    else if (tut.spawned === 'normal') msg = 'Align a node with the trap';
+    else if (tut.spawned === 'heavy') msg = 'Pin it with BOTH nodes at once';
+    else if (tut.spawned === 'line') msg = 'One node on EACH end of the wall';
+    else if (tut.spawned === 'lock0') msg = 'Only the BLUE node can break this one';
+    else if (tut.spawned === 'lock1') msg = 'Only the WHITE node can break this one';
+    else if (tut.spawned === 'frag') msg = "It's friendly — DON'T zap it";
+    else if (tut.spawned === 'pickup') msg = 'Catch the power-up with any node';
     if (msg) {
       const a = 0.75 + Math.sin(time * 4) * 0.25;
       ctx.textAlign = 'center';
@@ -1986,15 +2074,147 @@ function drawHUD(g) {
       ctx.fillText(msg, W / 2, H * 0.70);
       ctx.textAlign = 'left';
     }
+    const ten = enemies.find(e => e.tut && !e.dead && !e.resolved);
     if (ten) {
-      drawGuideArc(nodes[ten.tut === 'L' ? 0 : 1], ten.angle);
-      const d = dialCenter(ten.tut);
-      const pr = d.r + 6 + Math.sin(time * 5) * 3;
-      ctx.strokeStyle = ten.tut === 'L' ? 'rgba(111,227,255,0.8)' : 'rgba(255,255,255,0.8)';
-      ctx.lineWidth = 2.5;
-      ctx.beginPath(); ctx.arc(d.x, d.y, pr, 0, TAU); ctx.stroke();
+      if (ten.type === 'heavy') { drawGuideArc(nodes[0], ten.angle); drawGuideArc(nodes[1], ten.angle); }
+      else if (ten.type === 'line') { drawGuideArc(nodes[0], ten.angle); if (ten.partner) drawGuideArc(nodes[1], ten.partner.angle); }
+      else if (ten.lock !== undefined) drawGuideArc(nodes[ten.lock], ten.angle);
+      else if (ten.type !== 'frag') drawGuideArc(nn(ten.angle), ten.angle);
+    }
+    const tp = pickups.find(p => p.tut && !p.done);
+    if (tp) drawGuideArc(nn(tp.angle), tp.angle);
+    if (st.card === 'move') { // pulse both dials
+      for (const side of ['L', 'R']) {
+        const d = dialCenter(side);
+        const pr = d.r + 6 + Math.sin(time * 5) * 3;
+        ctx.strokeStyle = side === 'L' ? 'rgba(111,227,255,0.8)' : 'rgba(255,255,255,0.8)';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(d.x, d.y, pr, 0, TAU); ctx.stroke();
+      }
     }
   }
+}
+
+// ---------- briefing card (S.INFO) ----------
+function infoCrystal(r, pal) {
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 1.9);
+  gl.addColorStop(0, 'rgba(' + pal.glow + ',0.45)');
+  gl.addColorStop(1, 'rgba(' + pal.glow + ',0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, r * 1.9, 0, TAU); ctx.fill();
+  for (let i = 0; i < 10; i++) {
+    const a = i / 10 * TAU + time * 0.3;
+    const rr = r * (0.78 + (i % 3) * 0.12);
+    ctx.fillStyle = pal.shades[i % pal.shades.length];
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a - 0.30) * rr * 0.35, Math.sin(a - 0.30) * rr * 0.35);
+    ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    ctx.lineTo(Math.cos(a + 0.30) * rr * 0.35, Math.sin(a + 0.30) * rr * 0.35);
+    ctx.closePath(); ctx.fill();
+  }
+  const cg = ctx.createRadialGradient(-r * 0.1, -r * 0.12, 0, 0, 0, r * 0.45);
+  cg.addColorStop(0, '#ffffff');
+  cg.addColorStop(0.55, pal.core);
+  cg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = cg;
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.45, 0, TAU); ctx.fill();
+}
+const INFO_PAL = {
+  normal: { glow: '255,60,90',   shades: ['#e8274b', '#ff5a3c', '#d81f6e', '#b3123a', '#ff8c5a'], core: '#ff5a3c' },
+  heavy:  { glow: '200,70,255',  shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'], core: '#b03ae8' },
+  lock:   { glow: '80,170,255',  shades: ['#2f7fe0', '#1c4fae', '#4d9bff', '#12398a', '#3f8af0'], core: '#2f7fe0' },
+  frag:   { glow: '110,230,120', shades: ['#57c95f', '#2f9e46', '#8fe08a', '#1f7a35', '#6fdc74'], core: '#57c95f' }
+};
+function drawInfoGlyph(kind, cx, cy, r) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (kind === 'move') {
+    ctx.strokeStyle = 'rgba(10,16,28,0.95)'; ctx.lineWidth = r * 0.34;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = 'rgba(120,220,255,0.4)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.78, 0, TAU); ctx.stroke();
+    const demoA = time * 1.2;
+    for (const [a, col] of [[Math.PI + demoA, 'rgb(111,227,255)'], [demoA, '#ffffff']]) {
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(Math.cos(a) * r, Math.sin(a) * r, r * 0.18, 0, TAU); ctx.fill();
+    }
+  } else if (kind === 'pickup') {
+    const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 1.9);
+    gl.addColorStop(0, 'rgba(255,210,74,0.5)');
+    gl.addColorStop(1, 'rgba(255,210,74,0)');
+    ctx.fillStyle = gl;
+    ctx.beginPath(); ctx.arc(0, 0, r * 1.9, 0, TAU); ctx.fill();
+    ctx.rotate(time * 0.4);
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = i / 6 * TAU;
+      i ? ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(60,40,5,0.9)'; ctx.fill();
+    ctx.strokeStyle = '#ffd24a'; ctx.lineWidth = Math.max(2, r * 0.14); ctx.stroke();
+    ctx.rotate(-time * 0.4);
+    const s2 = r * 0.52;
+    ctx.fillStyle = '#ffe9b0';
+    ctx.beginPath();
+    ctx.moveTo(s2 * 0.3, -s2); ctx.lineTo(-s2 * 0.45, s2 * 0.15); ctx.lineTo(0, s2 * 0.15);
+    ctx.lineTo(-s2 * 0.3, s2); ctx.lineTo(s2 * 0.45, -0.15 * s2); ctx.lineTo(0, -0.15 * s2);
+    ctx.closePath(); ctx.fill();
+  } else if (kind === 'line') {
+    const off = r * 1.05;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,60,90,0.6)'; ctx.lineWidth = r * 0.26;
+    ctx.beginPath(); ctx.moveTo(-off, 0); ctx.lineTo(off, 0); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,180,195,0.9)'; ctx.lineWidth = r * 0.08;
+    ctx.beginPath(); ctx.moveTo(-off, 0); ctx.lineTo(off, 0); ctx.stroke();
+    for (const sx of [-off, off]) {
+      ctx.save(); ctx.translate(sx, 0);
+      infoCrystal(r * 0.55, INFO_PAL.normal);
+      ctx.restore();
+    }
+  } else {
+    infoCrystal(r, INFO_PAL[kind] || INFO_PAL.normal);
+    if (kind === 'heavy') { // both node colors demanded
+      ctx.strokeStyle = 'rgba(230,245,255,0.55)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, r * 1.3, 0, TAU); ctx.stroke();
+      const oa = time * 1.4;
+      ctx.fillStyle = 'rgb(111,227,255)';
+      ctx.beginPath(); ctx.arc(Math.cos(oa) * r * 1.3, Math.sin(oa) * r * 1.3, r * 0.16, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(Math.cos(oa + Math.PI) * r * 1.3, Math.sin(oa + Math.PI) * r * 1.3, r * 0.16, 0, TAU); ctx.fill();
+    }
+    if (kind === 'lock') { // single matching color
+      ctx.strokeStyle = 'rgb(111,227,255)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, r * 1.3, 0, TAU); ctx.stroke();
+      const oa = time * 1.4;
+      ctx.fillStyle = 'rgb(111,227,255)';
+      ctx.beginPath(); ctx.arc(Math.cos(oa) * r * 1.3, Math.sin(oa) * r * 1.3, r * 0.16, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawInfoCard() {
+  const c = INFO_CARDS[infoCard];
+  if (!c) return;
+  ctx.fillStyle = 'rgba(3,6,14,0.72)'; ctx.fillRect(0, 0, W, H);
+  const pw = Math.min(W * 0.78, 560), ph = Math.min(H * 0.76, 260);
+  const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+  techPanel(px, py, pw, ph, 'FIELD BRIEFING');
+  drawInfoGlyph(infoCard, px + 78, py + ph / 2 + 12, Math.min(ph * 0.16, 36));
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#eafaff'; ctx.font = '800 20px system-ui';
+  try { ctx.letterSpacing = '2px'; } catch (e) {}
+  ctx.fillText(c.title, px + 152, py + 76);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.fillStyle = 'rgba(190,225,255,0.85)'; ctx.font = '500 13px system-ui';
+  c.lines.forEach((ln, i) => ctx.fillText(ln, px + 152, py + 102 + i * 19));
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(140,230,255,' + (0.5 + Math.sin(time * 4) * 0.3).toFixed(2) + ')';
+  ctx.font = '700 12px system-ui';
+  try { ctx.letterSpacing = '3px'; } catch (e) {}
+  ctx.fillText('TAP TO CONTINUE', W / 2, py + ph - 20);
+  try { ctx.letterSpacing = '0px'; } catch (e) {}
+  ctx.textAlign = 'left';
 }
 
 // marching dashed arc from a node toward the tutorial trap, with an arrowhead
@@ -2254,7 +2474,7 @@ function menuGeom() {
   const ccx = W / 2, ccy = H / 2;
   const R = Math.min(H * 0.52, W * 0.30);
   const bw = Math.min(R * 1.4, W * 0.42), bh = 46, gap = 13;
-  const items = LEVELS.length + 1; // + the endless key
+  const items = LEVELS.length + 2; // + qualification and endless keys
   const listY = ccy - R + 52;
   const contentH = items * (bh + gap) - gap;
   const viewH = H - listY - 6;
@@ -2401,19 +2621,31 @@ function drawMenu(g) {
   ctx.rect(ccx - bw / 2 - 30, listY - 4, bw + 60, viewH + 8);
   ctx.clip();
   const endlessOpen = progress.stars[LEVELS.length - 1] > 0; // clear the campaign to unlock
-  for (let i = 0; i <= LEVELS.length; i++) {
+  for (let i = 0; i <= LEVELS.length + 1; i++) {
     const by = listY + i * (bh + gap) - menuScroll;
     if (by + bh < listY - 6 || by > listY + viewH + 6) continue;
     const bx = ccx - bw / 2;
-    if (i < LEVELS.length) {
-      const locked = i + 1 > progress.unlocked;
-      levelKey(bx, by, bw, bh, i + 1, LEVELS[i].name, progress.stars[i], locked, i + 1 === progress.unlocked);
-      if (!locked && (progress.bests[i] || 0) > 0) {
+    if (i === 0) { // training run — always open, highlighted until cleared
+      levelKey(bx, by, bw, bh, 'Q', 'QUALIFICATION', -1, false, !progress.tutorialDone);
+      if (progress.tutorialDone) { // cleared check
+        ctx.strokeStyle = '#7ee262'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(bx + bw - 40, by + bh / 2 + 1);
+        ctx.lineTo(bx + bw - 33, by + bh / 2 + 8);
+        ctx.lineTo(bx + bw - 20, by + bh / 2 - 8);
+        ctx.stroke();
+      }
+      menuButtons.push({ x: bx, y: by, w: bw, h: bh, qual: true, locked: false });
+    } else if (i <= LEVELS.length) {
+      const li = i - 1;
+      const locked = li + 1 > progress.unlocked;
+      levelKey(bx, by, bw, bh, li + 1, LEVELS[li].name, progress.stars[li], locked, li + 1 === progress.unlocked && progress.tutorialDone);
+      if (!locked && (progress.bests[li] || 0) > 0) {
         ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(255,210,74,0.75)'; ctx.font = '700 9px system-ui';
-        ctx.fillText('BEST ' + progress.bests[i].toLocaleString(), bx + bw - 14, by + bh - 5);
+        ctx.fillText('BEST ' + progress.bests[li].toLocaleString(), bx + bw - 14, by + bh - 5);
         ctx.textAlign = 'left';
       }
-      menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: i, locked });
+      menuButtons.push({ x: bx, y: by, w: bw, h: bh, level: li, locked });
     } else {
       levelKey(bx, by, bw, bh, '∞', 'ENDLESS STREAM', -1, !endlessOpen, endlessOpen);
       if (endlessOpen && progress.best > 0) {
@@ -2496,19 +2728,19 @@ function drawEnd(g) {
   const bh = 50;
   const panelBottom = (isLandscape() ? H * 0.66 + bh : H * 0.62 + list.length * (bh + 14) - 14) + 24;
   const pw = Math.min(W * 0.88, 700), pTop = H * 0.13;
-  techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + (endless ? 'ENDLESS STREAM' : LEVELS[levelIdx].name));
+  techPanel(W / 2 - pw / 2, pTop, pw, panelBottom - pTop, 'MISSION REPORT  //  ' + (endless ? 'ENDLESS STREAM' : qual ? 'QUALIFICATION' : LEVELS[levelIdx].name));
 
   ctx.textAlign = 'center';
-  const endCol = endless ? '#ffb340' : endWin ? '#69e05c' : '#ff4a5e';
+  const endCol = endless ? '#ffb340' : qual && endWin ? '#7ee262' : endWin ? '#69e05c' : '#ff4a5e';
   ctx.fillStyle = endCol;
   try { ctx.letterSpacing = '4px'; } catch (e) {}
   ctx.font = '800 ' + Math.min(W * 0.08, 38) + 'px system-ui';
   ctx.shadowColor = endCol; ctx.shadowBlur = 22;
-  ctx.fillText(endless ? 'STREAM SEVERED' : endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
+  ctx.fillText(endless ? 'STREAM SEVERED' : qual ? (endWin ? 'QUALIFIED' : 'TRAINING ABORTED') : endWin ? 'PAYLOAD DELIVERED' : 'PAYLOAD CORRUPTED', W / 2, H * 0.25 + 14);
   ctx.shadowBlur = 0;
   try { ctx.letterSpacing = '0px'; } catch (e) {}
 
-  if (endWin) drawStars(W / 2, H * 0.36, endStars, Math.min(W, H) * 0.045, endT);
+  if (endWin && !qual) drawStars(W / 2, H * 0.36, endStars, Math.min(W, H) * 0.045, endT);
 
   ctx.fillStyle = '#eaf4ff'; ctx.font = '700 26px system-ui';
   ctx.fillText(score.toLocaleString(), W / 2, H * 0.47);
@@ -2522,7 +2754,7 @@ function drawEnd(g) {
     ctx.fillStyle = score >= (progress.best || 0) && score > 0 ? '#ffd24a' : 'rgba(255,210,74,0.7)';
     ctx.font = '700 13px system-ui';
     ctx.fillText((score >= (progress.best || 0) && score > 0 ? 'NEW BEST  ' : 'BEST  ') + (progress.best || 0).toLocaleString(), W / 2, H * 0.47 + 68);
-  } else if (endWin || (progress.bests[levelIdx] || 0) > 0) {
+  } else if (!qual && (endWin || (progress.bests[levelIdx] || 0) > 0)) {
     ctx.fillStyle = endNewBest ? '#ffd24a' : 'rgba(255,210,74,0.7)';
     ctx.font = '700 13px system-ui';
     ctx.fillText((endNewBest ? 'NEW BEST  ' : 'BEST  ') + (progress.bests[levelIdx] || 0).toLocaleString(), W / 2, H * 0.47 + 68);
@@ -2686,6 +2918,7 @@ function frame(now) {
 
   if (state === S.PLAY) { drawHUD(g); drawDials(); }
   else if (state === S.PAUSE) { drawHUD(g); drawDials(); drawPause(); }
+  else if (state === S.INFO) { drawHUD(g); drawDials(); drawInfoCard(); }
   else if (state === S.MENU) drawMenu(g);
   else drawEnd(g);
 
