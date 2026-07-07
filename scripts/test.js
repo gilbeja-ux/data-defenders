@@ -96,7 +96,8 @@ code = code.replace("'use strict';", '') + `
   patternQ: () => patternQ, mutators, musicFilterHz: () => musicFilter && musicFilter.frequency.value,
   getPerfects: () => perfects, getScore: () => score,
   getIntro: () => introT, setIntro: v => { introT = v; introCd = 0; }, getLevelT: () => levelT,
-  startQualification, getInfoCard: () => infoCard, isQual: () => qual
+  startQualification, getInfoCard: () => infoCard, isQual: () => qual,
+  keys, setBeamDir: v => { beamDir = v; }, getHeat: () => heat, isOverheat: () => overheat
 };`;
 eval(code);
 const G = globalThis.__g;
@@ -273,23 +274,65 @@ G.fx.auto = 0;
 const c0 = G.endlessCfg(0), c200 = G.endlessCfg(200);
 check('endless difficulty ramps with time', c200.speed > c0.speed && c200.spawnMin < c0.spawnMin && c200.heavies > 0 && c0.heavies === 0);
 
-// ================= boss (CORE FIREWALL) =================
+// ================= boss duel (CORE FIREWALL) =================
+G.progress.bossBriefed = false;
 G.startLevel(7);
 G.setLevelT(46); // past the level clock
 G.update(0.01);
 check('firewall core spawns after the level clock', !!G.boss());
-const B = G.boss();
-B.z = G.geo().hitZ; B.angle = 1.0; B.drift = 0;
-aim(0, 1.0); aim(1, Math.PI); // one node parked on it
-G.update(0.05);
-check('node coverage drains the core', G.boss().hp < 8);
-let guard = 200;
-while (G.boss() && guard-- > 0) {
-  G.boss().cd[0] = 0; G.boss().drift = 0; G.boss().angle = 1.0;
-  aim(0, 1.0);
+check('boss briefing card shows first', G.getState() === G.S.INFO && G.getInfoCard() === 'boss');
+dismiss();
+check('briefing dismissed back to the duel', G.getState() === G.S.PLAY);
+for (let i = 0; i < 40 && G.boss().mergeT < 1; i++) G.update(0.05);
+check('nodes fuse into the ray cannon', G.boss().mergeT >= 1 && Math.abs(G.nodes[0].angle - G.nodes[1].angle) < 1e-6);
+function aimBeam() {
+  const g2 = G.geo();
+  const railR = g2.nodeR - Math.min(800, 450) * 0.055 * 0.86;
+  const nx = g2.cx + Math.cos(G.nodes[0].angle) * railR, ny = g2.cy + Math.sin(G.nodes[0].angle) * railR;
+  G.setBeamDir(Math.atan2(G.boss().y - ny, G.boss().x - nx));
+}
+G.keys['ArrowUp'] = true;
+const hp0 = G.boss().hp;
+for (let i = 0; i < 20; i++) { aimBeam(); G.update(0.05); }
+check('the beam drains the core', G.boss().hp < hp0);
+check('firing builds heat', G.getHeat() > 0.05);
+drawOk('boss duel frame (beam + heat gauge)', () => {});
+for (let i = 0; i < 220 && !G.isOverheat(); i++) {
+  aimBeam(); G.setIntegrity(100);
+  G.boss().hp = Math.max(G.boss().hp, 50); // keep it alive while we cook the cannon
   G.update(0.05);
 }
-check('draining the core to zero wins the level', G.getState() === G.S.END && G.getEndWin() === true);
+check('sustained fire overheats the cannon (~10s)', G.isOverheat() === true);
+const hpLock = G.boss().hp;
+for (let i = 0; i < 6; i++) { aimBeam(); G.update(0.05); }
+check('overheated cannon cannot fire', Math.abs(G.boss().hp - hpLock) < 1e-9);
+for (let i = 0; i < 60 && G.isOverheat(); i++) G.update(0.05); // ~2s forced cooldown, fire still held
+check('cooldown clears with fire still held', G.isOverheat() === false);
+G.keys['ArrowUp'] = false;
+// dodge mechanics
+const B2 = G.boss();
+aim(0, 1.0); aim(1, 1.0);
+B2.shots.length = 0; B2.shootT = 0.01;
+G.update(0.05); // fires at the cannon's current spot
+B2.shootT = 99;  // hold further fire
+check('the core returns fire', B2.shots.length > 0);
+aim(0, 2.4); aim(1, 2.4); // dodge away
+const hpMe = G.stats().integrity;
+for (let i = 0; i < 60 && B2.shots.length; i++) G.update(0.05);
+check('dodging the shot avoids damage', G.stats().integrity === hpMe);
+B2.shootT = 0.01;
+G.update(0.05);
+B2.shootT = 99;
+const hpMe2 = G.stats().integrity;
+for (let i = 0; i < 60 && B2.shots.length; i++) G.update(0.05); // stand still
+check('standing still takes the hit', hpMe2 - G.stats().integrity >= 18);
+// finish it
+G.keys['ArrowUp'] = true;
+G.boss().hp = 2;
+let bGuard = 120;
+while (G.boss() && bGuard-- > 0) { aimBeam(); G.setIntegrity(100); G.update(0.05); }
+G.keys['ArrowUp'] = false;
+check('destroying the core wins the level', G.getState() === G.S.END && G.getEndWin() === true);
 check('campaign completion recorded', G.progress.stars[7] > 0);
 
 // ================= endless mode =================
@@ -522,8 +565,13 @@ function soak(name, start, seconds) {
       if (live.length) { // crude autopilot
         aim(0, live[0].angle);
         aim(1, live[live.length - 1].angle);
-      } else if (G.boss()) {
-        aim(0, G.boss().angle);
+      } else if (G.boss() && G.boss().mergeT >= 1) {
+        const g2 = G.geo();
+        const railR = g2.nodeR - Math.min(800, 450) * 0.055 * 0.86;
+        const nx = g2.cx + Math.cos(G.nodes[0].angle) * railR, ny = g2.cy + Math.sin(G.nodes[0].angle) * railR;
+        G.setBeamDir(Math.atan2(G.boss().y - ny, G.boss().x - nx));
+        G.keys['ArrowUp'] = true;
+        aim(0, G.nodes[0].angle + 0.05); // keep drifting so shots miss sometimes
       }
       G.update(0.05);
       simNow += 50;
@@ -541,6 +589,7 @@ soak('quantum relay (color locks)', () => G.startLevel(5), 70);
 soak('darknet edge (waves + bursts)', () => G.startLevel(6), 80);
 soak('core firewall (boss fight)', () => G.startLevel(7), 90);
 soak('endless ramp', () => G.startEndless(), 150);
+G.keys['ArrowUp'] = false;
 
 // ================= Web Audio music looper =================
 const tick = () => new Promise(r => setImmediate(r));

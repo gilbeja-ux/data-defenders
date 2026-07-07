@@ -233,6 +233,29 @@ function buzz(pattern) {
     } else if (navigator.vibrate) navigator.vibrate(pattern);
   } catch (e) {}
 }
+// continuous ray-cannon drone — pitch rises with heat
+let beamOscs = null;
+function beamSound(on, heatVal) {
+  if (!AC || !sfxGain) return;
+  if (on && !beamOscs) {
+    try {
+      const o1 = AC.createOscillator(), g1 = AC.createGain();
+      o1.type = 'sawtooth'; o1.frequency.value = 60; g1.gain.value = 0.045;
+      o1.connect(g1); g1.connect(sfxGain); o1.start();
+      const o2 = AC.createOscillator(), g2 = AC.createGain();
+      o2.type = 'square'; o2.frequency.value = 240; g2.gain.value = 0.02;
+      o2.connect(g2); g2.connect(sfxGain); o2.start();
+      beamOscs = { o1, o2 };
+    } catch (e) { beamOscs = null; }
+  } else if (!on && beamOscs) {
+    try { beamOscs.o1.stop(); beamOscs.o2.stop(); } catch (e) {}
+    beamOscs = null;
+  }
+  if (beamOscs) {
+    beamOscs.o1.frequency.value = 60 + heatVal * 55;
+    beamOscs.o2.frequency.value = 240 + heatVal * 230 + Math.sin(time * 30) * 12;
+  }
+}
 const sfx = {
   zap(combo) { // pitch climbs with the combo — every zap in a streak sounds sweeter
     const m = Math.pow(1.059, Math.min(combo || 1, 12));
@@ -243,6 +266,8 @@ const sfx = {
   slowDown() { tone(880, 0.50, 'sawtooth', 0.12, 180); tone(440, 0.65, 'triangle', 0.10, 110); },
   perfect() { tone(2093, 0.14, 'triangle', 0.13, 2637); tone(3136, 0.10, 'sine', 0.08, 3520); },
   count() { tone(600, 0.12, 'square', 0.12, 560); },
+  overheatWarn() { tone(220, 0.5, 'sawtooth', 0.13, 90); tone(110, 0.6, 'square', 0.1, 60); },
+  bossShot() { tone(140, 0.22, 'sawtooth', 0.13, 70); },
   go()    { tone(880, 0.20, 'square', 0.14, 1320); tone(1760, 0.30, 'triangle', 0.10, 2200); },
   speedUp()  { tone(180, 0.45, 'sawtooth', 0.11, 880); tone(110, 0.55, 'triangle', 0.09, 440); },
   miss() { tone(160, 0.35, 'sawtooth', 0.14, 60); },
@@ -463,7 +488,7 @@ function endlessCfg(t) {
     bursts: t > 70, waves: t > 100
   };
 }
-const progress = { unlocked: 1, stars: [0, 0, 0, 0, 0, 0, 0, 0], bests: [0, 0, 0, 0, 0, 0, 0, 0], tutorialDone: false, best: 0 };
+const progress = { unlocked: 1, stars: [0, 0, 0, 0, 0, 0, 0, 0], bests: [0, 0, 0, 0, 0, 0, 0, 0], tutorialDone: false, bossBriefed: false, best: 0 };
 
 // ---------- persistence ----------
 const STORE_KEY = 'dataDefenders.v1';
@@ -501,6 +526,7 @@ const fx = { slow: 0, wide: 0, auto: 0 }; // power-up effect timers (seconds)
 let pickups = [], pickupT = 20;
 let tut = null;               // tutorial controller (level 1, first run)
 let boss = null;              // firewall core (levels with boss: true)
+let heat = 0, overheat = false, beamDir = 0, beamActive = false; // ray-cannon duel state
 let burstQ = null;            // pending burst-volley spawns
 let patternQ = [];            // beat-choreographed volley schedule
 let endless = false, qual = false, LV = null, runTrack = 0; // active run config + its soundtrack
@@ -636,12 +662,118 @@ function spawnPickup() {
   const kinds = Object.keys(PICKUPS);
   pickups.push({ kind: kinds[(Math.random() * kinds.length) | 0], z: 1.12, angle: Math.random() * TAU, spin: 0, done: false });
 }
-// the firewall core: parks at the ring and must be drained by node coverage
+// the firewall core duel: it hunts the fused node from inside the tunnel while
+// the ray cannon (left thumb = move, right thumb = aim, hold = fire) drains it
 function spawnBoss() {
+  enemies = []; pickups = []; burstQ = null; patternQ = []; // the lane clears for the duel
   boss = {
-    hp: 8, maxHp: 8, z: 1.12, angle: Math.random() * TAU, spin: 0,
-    drift: 0.22, retarget: 3, minionT: 3.5, cd: [0, 0], flash: 0
+    hp: 100, maxHp: 100,
+    ang: Math.random() * TAU, rad: 0.35, tAng: Math.random() * TAU, tRad: 0.35,
+    x: W / 2, y: H / 2, retarget: 2,
+    spin: 0, hurtT: 0,
+    shootT: 2.4, shots: [],
+    mergeT: 0, mergeFrom: [nodes[0].angle, nodes[1].angle]
   };
+  heat = 0; overheat = false; beamActive = false;
+  popup(W / 2, H * 0.30, 'FIREWALL CORE ONLINE', '#d465ff');
+  shake = Math.min(shake + 0.6, 1);
+  buzz([30, 40, 60]);
+  if (!progress.bossBriefed) { progress.bossBriefed = true; saveState(); showCard('boss'); }
+}
+function updateBossFight(dt, g) {
+  const b = boss;
+  b.spin += dt * 2;
+  b.hurtT = Math.max(0, b.hurtT - dt);
+  // wander inside the tunnel mouth — harder to hit
+  b.retarget -= dt;
+  if (b.retarget <= 0) { b.retarget = rand(1.8, 3.2); b.tAng = Math.random() * TAU; b.tRad = rand(0.15, 0.6); }
+  b.ang += angDiff(b.tAng, b.ang) * Math.min(1, dt * 1.2);
+  b.rad = lerp(b.rad, b.tRad, Math.min(1, dt * 1.5));
+  b.x = g.cx + Math.cos(b.ang) * b.rad * g.nodeR;
+  b.y = g.cy + Math.sin(b.ang) * b.rad * g.nodeR + Math.sin(time * 1.7) * g.nodeR * 0.04;
+  // fuse animation: both carriages slide together into the cannon
+  if (b.mergeT < 1) {
+    b.mergeT = Math.min(1, b.mergeT + dt / 0.9);
+    const e = 1 - Math.pow(1 - b.mergeT, 3);
+    const mid = b.mergeFrom[0] + angDiff(b.mergeFrom[1], b.mergeFrom[0]) / 2;
+    nodes[0].angle = b.mergeFrom[0] + angDiff(mid, b.mergeFrom[0]) * e;
+    nodes[1].angle = b.mergeFrom[1] + angDiff(mid, b.mergeFrom[1]) * e;
+    if (b.mergeT >= 1) {
+      const railR0 = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
+      const mx = g.cx + Math.cos(nodes[0].angle) * railR0, my = g.cy + Math.sin(nodes[0].angle) * railR0;
+      burst(mx, my, '#6fe3ff', 20, 5);
+      burst(mx, my, '#ffffff', 20, 5);
+      beamDir = Math.atan2(b.y - my, b.x - mx);
+      sfx.go();
+      buzz(30);
+    }
+    return;
+  }
+  nodes[1].angle = nodes[0].angle; // one fused carriage
+  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
+  const nx = g.cx + Math.cos(nodes[0].angle) * railR, ny = g.cy + Math.sin(nodes[0].angle) * railR;
+  // ray cannon: hold to fire, watch the heat
+  const beamOn = Object.values(pointers).some(p => p.beam) || !!keys['ArrowUp'];
+  if (keys['ArrowLeft']) beamDir -= 3.5 * dt;
+  if (keys['ArrowRight']) beamDir += 3.5 * dt;
+  beamActive = beamOn && !overheat;
+  if (beamActive) {
+    heat = Math.min(1, heat + dt / 10); // ~10s of sustained fire
+    if (heat >= 1) { overheat = true; beamActive = false; sfx.overheatWarn(); buzz([60, 60, 60]); }
+  } else if (overheat) {
+    heat -= dt / 2; // ~2s forced cooldown
+    if (heat <= 0) { heat = 0; overheat = false; sfx.tick(); }
+  } else {
+    heat = Math.max(0, heat - dt / 2.5);
+  }
+  if (beamActive) {
+    const dx = Math.cos(beamDir), dy = Math.sin(beamDir);
+    const ox = b.x - nx, oy = b.y - ny;
+    const along = ox * dx + oy * dy;
+    const bR = Math.min(W, H) * 0.11;
+    if (along > 0 && Math.abs(-dy * ox + dx * oy) < bR) { // the beam is on the core
+      b.hp -= 15 * dt;
+      b.hurtT = 0.15;
+      if (Math.random() < 0.6) burst(b.x + rand(-10, 10), b.y + rand(-10, 10), '#d98cff', 2, 3);
+      if (b.hp <= 0) {
+        burst(b.x, b.y, '#ffffff', 50, 6);
+        burst(b.x, b.y, '#d465ff', 50, 5);
+        popup(b.x, b.y, 'FIREWALL DOWN  +' + Math.round(2000 * mutMul()), '#ffd24a');
+        score += Math.round(2000 * mutMul());
+        shake = 1;
+        buzz([60, 40, 80]);
+        beamSound(false, 0);
+        boss = null;
+        endLevel(true);
+        return;
+      }
+    }
+  }
+  beamSound(beamActive, heat);
+  // the core returns fire at the cannon's position — move or take it
+  b.shootT -= dt;
+  if (b.shootT <= 0) {
+    b.shootT = rand(1.5, 2.5) * (b.hp < 35 ? 0.7 : 1); // enrages when wounded
+    const d2 = Math.hypot(nx - b.x, ny - b.y);
+    b.shots.push({ x: b.x, y: b.y, tx: nx, ty: ny, t: 0, dur: Math.max(0.35, d2 / (Math.min(W, H) * 0.55)) });
+    sfx.bossShot();
+  }
+  for (const sh of b.shots) {
+    sh.t += dt;
+    if (!sh.done && sh.t >= sh.dur) {
+      sh.done = true;
+      if (Math.hypot(nx - sh.tx, ny - sh.ty) < Math.min(W, H) * 0.05) { // connected
+        integrity = Math.max(0, integrity - 18);
+        redFlash = 1; shake = Math.min(shake + 0.7, 1);
+        burst(nx, ny, '#ff4a5e', 24, 4);
+        sfx.miss();
+        buzz([50, 30, 70]);
+      } else {
+        burst(sh.tx, sh.ty, '#d465ff', 8, 2.5); // splash on the ring
+      }
+    }
+  }
+  b.shots = b.shots.filter(sh => sh.t < sh.dur + 0.05);
 }
 
 // ---------- particles ----------
@@ -732,8 +864,15 @@ canvas.addEventListener('pointerdown', e => {
     state = S.PAUSE; sfx.tick(); return;
   }
   const side = P.x < W / 2 ? 'L' : 'R';
+  const a0 = pointerAngle(side, P.x, P.y);
+  if (boss && boss.mergeT >= 1 && side === 'R') { // fire stick: aim + hold to fire
+    pointers[e.pointerId] = { side, beam: true };
+    beamDir = a0;
+    canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+    return;
+  }
   // relative control: touching does NOT snap the node — record the start angle
-  pointers[e.pointerId] = { side, lastA: pointerAngle(side, P.x, P.y) };
+  pointers[e.pointerId] = { side, lastA: a0 };
   canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove', e => {
@@ -752,6 +891,7 @@ canvas.addEventListener('pointermove', e => {
   }
   const p = pointers[e.pointerId];
   if (!p || state !== S.PLAY) return;
+  if (p.beam) { beamDir = pointerAngle('R', P.x, P.y); return; }
   const a = pointerAngle(p.side, P.x, P.y);
   const delta = angDiff(a, p.lastA);
   p.lastA = a;
@@ -854,6 +994,7 @@ function resetRun() {
   score = 0; zaps = 0; misses = 0; combo = 0; perfects = 0; fragsHit = 0;
   enemies = []; particles = []; popups = []; bolts = []; pickups = [];
   boss = null; burstQ = null; patternQ = []; hitStop = 0;
+  heat = 0; overheat = false; beamActive = false; beamSound(false, 0);
   introT = 0; introCd = -1;
   for (const n of nodes) { n.formedFx = false; n.formAt = 0; }
   fx.slow = fx.wide = fx.auto = 0; pickupT = rand(16, 24);
@@ -887,6 +1028,7 @@ function startEndless() {
 }
 
 function endLevel(win) {
+  beamSound(false, 0); beamActive = false;
   endWin = win; endT = 0;
   endStars = win && !endless && !qual ? (integrity >= 90 ? 3 : integrity >= 60 ? 2 : 1) : 0;
   if (qual) {
@@ -927,7 +1069,8 @@ const INFO_CARDS = {
   line:   { title: 'BARRIER LINE', lines: ['Two traps linked by an energy wall.', 'Cover BOTH ENDS — one node on each.'] },
   lock:   { title: 'COLOR LOCK', lines: ['Keyed to a single node. Only the', 'MATCHING color can break it —', 'watch the orbiting dot.'] },
   frag:   { title: 'FRIENDLY PACKET', lines: ['Green payload data. NOT a threat.', 'Do NOT zap it — let it pass', 'and collect the bonus.'] },
-  pickup: { title: 'POWER-UP', lines: ['Golden relays ride the stream.', 'Catch one with any node:', 'SLOW-MO · WIDE ARC · AUTO-ZAP.'] }
+  pickup: { title: 'POWER-UP', lines: ['Golden relays ride the stream.', 'Catch one with any node:', 'SLOW-MO · WIDE ARC · AUTO-ZAP.'] },
+  boss:   { title: 'FIREWALL CORE', lines: ['Your nodes fuse into a RAY CANNON.', 'LEFT thumb moves it, RIGHT thumb aims —', 'hold to fire. Dodge its shots.', 'Sustained fire OVERHEATS the cannon.'] }
 };
 function showCard(key) {
   infoCard = key; infoShownAt = time;
@@ -1039,8 +1182,10 @@ function update(dt) {
   const kSpd = 4.5 * dt;
   if (keys['a'] || keys['A']) nodes[0].angle -= kSpd;
   if (keys['d'] || keys['D']) nodes[0].angle += kSpd;
-  if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
-  if (keys['ArrowRight']) nodes[1].angle += kSpd;
+  if (!boss) {
+    if (keys['ArrowLeft'])  nodes[1].angle -= kSpd;
+    if (keys['ArrowRight']) nodes[1].angle += kSpd;
+  }
 
   if (!inIntro) {
     if (tut) updateTutorial(sdt);
@@ -1073,7 +1218,6 @@ function update(dt) {
       };
       for (const en of enemies) if (!en.dead && !en.resolved && en.type !== 'frag') consider(en.angle, en.z, en.lock);
       for (const p of pickups) if (!p.done) consider(p.angle, p.z);
-      if (boss) consider(boss.angle, g.hitZ, undefined);
       if (best !== null) nodes[i].angle += clamp(angDiff(best, nodes[i].angle), -0.6, 0.6) * 2.2 * dt;
     }
   }
@@ -1214,47 +1358,10 @@ function update(dt) {
   }
   pickups = pickups.filter(p => !p.dead && p.z > 0.03);
 
-  // the firewall core: park at the ring, drift, drain under node coverage
+  // the firewall core duel
   if (boss) {
-    boss.spin += sdt * 3;
-    boss.flash = Math.max(0, boss.flash - dt);
-    if (boss.z > g.hitZ * 1.7) boss.z -= L.speed * 0.5 * sdt;
-    boss.angle += boss.drift * sdt;
-    boss.retarget -= sdt;
-    if (boss.retarget <= 0) {
-      boss.retarget = rand(2.5, 4.5);
-      boss.drift = (Math.random() < 0.5 ? -1 : 1) * rand(0.15, 0.4);
-    }
-    for (let i = 0; i < 2; i++) {
-      boss.cd[i] = Math.max(0, boss.cd[i] - sdt);
-      if (boss.cd[i] <= 0 && boss.z <= g.hitZ * 2 && Math.abs(angDiff(nodes[i].angle, boss.angle)) < TOL * 1.2) {
-        boss.cd[i] = 0.55;
-        boss.hp--;
-        boss.flash = 0.2;
-        const t0 = ringXY(boss.angle), s0 = nodeXY(nodes[i]);
-        spawnBolt(s0.x, s0.y, t0.x, t0.y);
-        burst(t0.x, t0.y, '#d98cff', 18, 4);
-        score += Math.round(150 * mutMul());
-        hitStop = Math.min(hitStop + 0.04, 0.12);
-        sfx.zap(4);
-        buzz(20);
-        if (boss.hp <= 0) {
-          burst(t0.x, t0.y, '#ffffff', 40, 6);
-          burst(t0.x, t0.y, '#d98cff', 40, 5);
-          popup(t0.x, t0.y, 'FIREWALL DOWN  +' + Math.round(2000 * mutMul()), '#ffd24a');
-          score += Math.round(2000 * mutMul());
-          boss = null;
-          shake = 1;
-          buzz([60, 40, 80]);
-          endLevel(true);
-          return;
-        }
-      }
-    }
-    if (boss) {
-      boss.minionT -= sdt;
-      if (boss.minionT <= 0) { boss.minionT = rand(3.5, 5.5); spawnEnemy(); }
-    }
+    updateBossFight(dt, g);
+    if (!boss || state !== S.PLAY) return; // victory mid-update
   }
 
   if (integrity <= 0) { endLevel(false); return; }
@@ -1573,56 +1680,6 @@ function drawPickup(p, g) {
   ctx.restore();
 }
 
-// the firewall core — armored violet mass parked at the ring with an hp fan
-function drawBoss(g) {
-  const rg = ring(Math.max(boss.z, 0.02), g);
-  const x = rg.x + Math.cos(boss.angle) * rg.r, y = rg.y + Math.sin(boss.angle) * rg.r;
-  const size = Math.min(W, H) * 0.085 * (1 + Math.sin(boss.spin * 1.6) * 0.05);
-  const fade = clamp((1.08 - boss.z) / 0.18, 0, 1);
-  if (fade <= 0.005) return;
-  ctx.save();
-  ctx.globalAlpha = fade;
-  ctx.translate(x, y);
-  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 3);
-  gl.addColorStop(0, 'rgba(210,80,255,0.5)');
-  gl.addColorStop(0.5, 'rgba(255,60,90,0.18)');
-  gl.addColorStop(1, 'rgba(255,60,90,0)');
-  ctx.fillStyle = gl;
-  ctx.beginPath(); ctx.arc(0, 0, size * 3, 0, TAU); ctx.fill();
-  // rotating shard collar
-  ctx.rotate(boss.spin * 0.5);
-  for (let i = 0; i < 12; i++) {
-    const a2 = i / 12 * TAU;
-    const r1 = size * 1.15, r2 = size * (1.5 + (i % 3) * 0.16);
-    ctx.fillStyle = i % 2 ? '#8a2ad4' : '#d465ff';
-    ctx.beginPath();
-    ctx.moveTo(Math.cos(a2 - 0.1) * r1, Math.sin(a2 - 0.1) * r1);
-    ctx.lineTo(Math.cos(a2) * r2, Math.sin(a2) * r2);
-    ctx.lineTo(Math.cos(a2 + 0.1) * r1, Math.sin(a2 + 0.1) * r1);
-    ctx.closePath(); ctx.fill();
-  }
-  ctx.rotate(-boss.spin * 0.5);
-  // armored core, flashing white when drained
-  const flash = boss.flash > 0 ? boss.flash / 0.2 : 0;
-  const cg2 = ctx.createRadialGradient(-size * 0.15, -size * 0.18, 0, 0, 0, size * 1.1);
-  cg2.addColorStop(0, flash > 0.3 ? '#ffffff' : '#f3d4ff');
-  cg2.addColorStop(0.45, '#b03ae8');
-  cg2.addColorStop(1, '#3a0a5e');
-  ctx.fillStyle = cg2;
-  ctx.beginPath(); ctx.arc(0, 0, size * 1.05, 0, TAU); ctx.fill();
-  ctx.strokeStyle = 'rgba(255,255,255,' + (0.25 + flash * 0.75).toFixed(2) + ')';
-  ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.arc(0, 0, size * 1.05, 0, TAU); ctx.stroke();
-  // hp pips fanned above the core
-  for (let i = 0; i < boss.maxHp; i++) {
-    const a0 = -Math.PI / 2 + (i - boss.maxHp / 2 + 0.5) * 0.26;
-    ctx.strokeStyle = i < boss.hp ? '#ff5a8c' : 'rgba(255,255,255,0.15)';
-    ctx.lineWidth = Math.max(2, size * 0.1);
-    ctx.beginPath(); ctx.arc(0, 0, size * 1.45, a0 - 0.09, a0 + 0.09); ctx.stroke();
-  }
-  ctx.restore();
-}
-
 // energy wall strung between the two ends of a barrier pair — drawn under the traps
 function drawLineBeam(en, g) {
   const p = en.partner;
@@ -1653,16 +1710,112 @@ function drawLineBeam(en, g) {
   ctx.restore();
 }
 
+// the firewall core — a hunting mass floating in the tunnel, plus its return fire
+function drawBoss(g) {
+  const b = boss;
+  // shots first (under the core)
+  for (const sh of b.shots) {
+    const k = clamp(sh.t / sh.dur, 0, 1);
+    const x = lerp(sh.x, sh.tx, k), y = lerp(sh.y, sh.ty, k);
+    const px2 = lerp(sh.x, sh.tx, Math.max(0, k - 0.06)), py2 = lerp(sh.y, sh.ty, Math.max(0, k - 0.06));
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(212,101,255,0.45)'; ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(x, y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,220,255,0.95)'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(x, y); ctx.stroke();
+  }
+  const size = Math.min(W, H) * 0.11 * (1 + Math.sin(b.spin * 1.6) * 0.04);
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, size * 2.6);
+  gl.addColorStop(0, 'rgba(210,80,255,0.5)');
+  gl.addColorStop(0.5, 'rgba(255,60,90,0.16)');
+  gl.addColorStop(1, 'rgba(255,60,90,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(0, 0, size * 2.6, 0, TAU); ctx.fill();
+  // rotating shard collar
+  ctx.rotate(b.spin * 0.5);
+  for (let i = 0; i < 14; i++) {
+    const a2 = i / 14 * TAU;
+    const r1 = size * 1.1, r2 = size * (1.45 + (i % 3) * 0.15);
+    ctx.fillStyle = i % 2 ? '#8a2ad4' : '#d465ff';
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a2 - 0.09) * r1, Math.sin(a2 - 0.09) * r1);
+    ctx.lineTo(Math.cos(a2) * r2, Math.sin(a2) * r2);
+    ctx.lineTo(Math.cos(a2 + 0.09) * r1, Math.sin(a2 + 0.09) * r1);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.rotate(-b.spin * 0.5);
+  // armored core, flashing white under the beam
+  const flash = b.hurtT > 0 ? b.hurtT / 0.15 : 0;
+  const cg2 = ctx.createRadialGradient(-size * 0.15, -size * 0.18, 0, 0, 0, size * 1.05);
+  cg2.addColorStop(0, flash > 0.3 ? '#ffffff' : '#f3d4ff');
+  cg2.addColorStop(0.45, '#b03ae8');
+  cg2.addColorStop(1, '#3a0a5e');
+  ctx.fillStyle = cg2;
+  ctx.beginPath(); ctx.arc(0, 0, size, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,' + (0.25 + flash * 0.75).toFixed(2) + ')';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, size, 0, TAU); ctx.stroke();
+  ctx.restore();
+}
+// the fused ray cannon: aim barrel + beam + impact
+function drawBeam(g) {
+  const b = boss;
+  if (!b || b.mergeT < 1) return;
+  const railR = g.nodeR - Math.min(W, H) * 0.055 * 0.86;
+  const nx = g.cx + Math.cos(nodes[0].angle) * railR, ny = g.cy + Math.sin(nodes[0].angle) * railR;
+  const size = Math.min(W, H) * 0.038;
+  const dx = Math.cos(beamDir), dy = Math.sin(beamDir);
+  const heatCol = heat < 0.5 ? '140,225,255' : heat < 0.8 ? '255,190,90' : '255,90,70';
+  // barrel
+  ctx.save();
+  ctx.translate(nx, ny);
+  ctx.rotate(beamDir);
+  ctx.fillStyle = '#0d1626';
+  roundRect(0, -size * 0.24, size * 1.5, size * 0.48, 4); ctx.fill();
+  ctx.strokeStyle = 'rgba(' + heatCol + ',0.9)'; ctx.lineWidth = 1.5;
+  roundRect(0, -size * 0.24, size * 1.5, size * 0.48, 4); ctx.stroke();
+  ctx.fillStyle = 'rgba(' + heatCol + ',' + (0.35 + heat * 0.6).toFixed(2) + ')';
+  ctx.fillRect(size * 0.25, -size * 0.12, size * 1.1 * heat, size * 0.24); // heat window
+  ctx.restore();
+  if (!beamActive) return;
+  // beam: stop at the core when on target, else run to the far wall
+  const ox = b.x - nx, oy = b.y - ny;
+  const along = ox * dx + oy * dy;
+  const onTarget = along > 0 && Math.abs(-dy * ox + dx * oy) < Math.min(W, H) * 0.11;
+  const len = onTarget ? along : Math.hypot(W, H);
+  const ex = nx + dx * len, ey = ny + dy * len;
+  const wob = Math.sin(time * 40) * 1.5;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(' + heatCol + ',0.30)'; ctx.lineWidth = 13 + wob;
+  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.strokeStyle = 'rgba(' + heatCol + ',0.7)'; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(nx + dx * size * 1.4, ny + dy * size * 1.4); ctx.lineTo(ex, ey); ctx.stroke();
+  if (onTarget) { // impact bloom
+    const ig = ctx.createRadialGradient(ex, ey, 0, ex, ey, size * 1.6);
+    ig.addColorStop(0, 'rgba(255,255,255,0.85)');
+    ig.addColorStop(0.4, 'rgba(' + heatCol + ',0.5)');
+    ig.addColorStop(1, 'rgba(' + heatCol + ',0)');
+    ctx.fillStyle = ig;
+    ctx.beginPath(); ctx.arc(ex, ey, size * 1.6, 0, TAU); ctx.fill();
+  }
+}
+
 function drawNodes(g) {
   const bzn = Math.min(W, H) * 0.055;
   const railR = g.nodeR - bzn * 0.86;             // carriages ride the rails on the ring's inner face
   const nearR = { x: g.cx, y: g.cy, r: railR };
+  const fused = boss && boss.mergeT >= 1;
   for (let i = 0; i < 2; i++) {
+    if (fused && i === 1) continue; // one combined cannon carriage
     const n = nodes[i];
     const x = nearR.x + Math.cos(n.angle) * nearR.r;
     const y = nearR.y + Math.sin(n.angle) * nearR.r;
-    const size = Math.min(W, H) * 0.038;
-    const cCol = i === 0 ? '111,227,255' : '255,255,255'; // left: Tron cyan, right: white
+    const size = Math.min(W, H) * 0.038 * (fused ? 1.35 : 1);
+    const cCol = fused ? '160,240,255' : i === 0 ? '111,227,255' : '255,255,255';
     // intro: each carriage materializes when the forming ring reaches it
     if (state === S.PLAY || state === S.PAUSE) {
       const p2 = clamp(introT / 2.0, 0, 1);
@@ -1699,6 +1852,7 @@ function drawNodes(g) {
       ctx.stroke();
     }
     // coverage arc hint — drawn on the ring itself; grows/shrinks with wide-arc
+    if (!fused) {
     const cov = 0.314 * tolVis;
     const wideGlow = clamp((tolVis - 1) / 0.7, 0, 1);
     ctx.beginPath();
@@ -1710,6 +1864,7 @@ function drawNodes(g) {
       ctx.arc(nearR.x, nearR.y, g.nodeR + 5, n.angle - cov, n.angle + cov);
       ctx.strokeStyle = `rgba(255,210,74,${(wideGlow * (0.35 + Math.sin(time * 6) * 0.15)).toFixed(2)})`;
       ctx.lineWidth = 2; ctx.stroke();
+    }
     }
     // glow
     const gl = ctx.createRadialGradient(x, y, 0, x, y, size * 2.6);
@@ -1772,8 +1927,25 @@ function drawDials() {
     ctx.lineWidth = 3; ctx.stroke();
     ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, TAU);
     ctx.fillStyle = 'rgba(10,20,45,0.35)'; ctx.fill();
+    // boss duel: the right dial is the fire stick — heat ring + aim knob
+    const fireStick = boss && boss.mergeT >= 1 && side === 'R';
+    if (fireStick) {
+      const hcol = heat < 0.5 ? '111,227,255' : heat < 0.8 ? '255,180,80' : '255,70,70';
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(' + hcol + ',' + (overheat ? (Math.sin(time * 12) > 0 ? 0.95 : 0.3) : 0.85).toFixed(2) + ')';
+      ctx.lineWidth = 5;
+      if (heat > 0.005) {
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r + 7, -Math.PI / 2, -Math.PI / 2 + heat * TAU); ctx.stroke();
+      }
+      if (overheat) {
+        ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(255,80,80,0.9)'; ctx.font = '700 11px system-ui';
+        ctx.fillText('OVERHEAT', d.x, d.y - d.r - 14);
+        ctx.textAlign = 'left';
+      }
+    }
     // knob
-    const kx = d.x + Math.cos(n.angle) * d.r, ky = d.y + Math.sin(n.angle) * d.r;
+    const ka = fireStick ? beamDir : n.angle;
+    const kx = d.x + Math.cos(ka) * d.r, ky = d.y + Math.sin(ka) * d.r;
     const ks = d.r * 0.3;
     const gl = ctx.createRadialGradient(kx, ky, 0, kx, ky, ks * 2);
     gl.addColorStop(0, i === 0 ? 'rgba(77,141,255,0.6)' : 'rgba(255,255,255,0.55)');
@@ -1820,9 +1992,10 @@ function drawDials() {
       ctx.fillStyle = 'rgba(255,210,74,0.9)';
       ctx.beginPath(); ctx.arc(gx, gy, 2.5 + (1 - p.z) * 2, 0, TAU); ctx.fill();
     }
-    // the firewall core: oversized blinking blip
+    // the firewall core: oversized blinking blip at its tunnel position
     if (boss) {
-      const { x: bx2, y: by2 } = blipXY(boss);
+      const rr2 = d.r * clamp(boss.rad || 0, 0, 1) * 0.85;
+      const bx2 = d.x + Math.cos(boss.ang || 0) * rr2, by2 = d.y + Math.sin(boss.ang || 0) * rr2;
       ctx.fillStyle = Math.sin(time * 8) > 0 ? 'rgba(210,80,255,0.95)' : 'rgba(210,80,255,0.45)';
       const bs2 = 7;
       ctx.fillRect(bx2 - bs2 / 2, by2 - bs2 / 2, bs2, bs2);
@@ -1982,26 +2155,33 @@ function drawHUD(g) {
   ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
   ctx.strokeStyle = '#050a12'; ctx.lineWidth = bw2 + 2;
   ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL1); ctx.stroke();
-  // endless: the left bar shows the difficulty ramp instead of level progress
-  const prog = endless ? clamp(levelT / 150, 0, 1) : clamp(levelT / L.duration, 0, 1);
+  // left arc: level progress · endless ramp · or the CORE's health during the duel
+  const prog = boss ? clamp(boss.hp / boss.maxHp, 0, 1) : endless ? clamp(levelT / 150, 0, 1) : clamp(levelT / L.duration, 0, 1);
   if (prog > 0.005) {
-    ctx.strokeStyle = endless ? '#ff9a3c' : '#7ee262';
+    ctx.strokeStyle = boss ? '#d465ff' : endless ? '#ff9a3c' : '#7ee262';
     ctx.lineWidth = bw2 - 4;
     ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aL0, aL0 + (aL1 - aL0) * prog); ctx.stroke();
   }
 
-  // right curved bar: 4 life blocks joined into one bar — no outline, just the blocks
-  const MAXM = 4, blocksLeft = Math.max(0, Math.ceil(integrity / 25));
+  // right curved bar: 4 life blocks — or a continuous hitpoint bar during the duel
   const aR0 = -Math.PI * 0.06, aR1 = -ELEV; // mirrored: lower-right → upper-right
-  const span = (aR0 - aR1) / MAXM, gap2 = span * 0.07; // thin seams keep them reading as one bar
   ctx.lineCap = 'butt';
-  for (let i = 0; i < MAXM; i++) {
-    const s0 = aR0 - (i + 1) * span + gap2 / 2, s1 = aR0 - i * span - gap2 / 2;
-    if (i < blocksLeft) {
-      ctx.strokeStyle = '#8fc7ff'; ctx.lineWidth = bw2;
-      ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, s0, s1); ctx.stroke();
-    } else {
-      ctx.strokeStyle = 'rgba(15,28,48,0.8)'; ctx.lineWidth = bw2;
+  if (boss) {
+    ctx.strokeStyle = 'rgba(15,28,48,0.8)'; ctx.lineWidth = bw2;
+    ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aR1, aR0); ctx.stroke();
+    const hpF = clamp(integrity / 100, 0, 1);
+    if (hpF > 0.005) {
+      ctx.strokeStyle = hpF > 0.5 ? '#7ee262' : hpF > 0.25 ? '#ffb340' : '#ff4a5e';
+      ctx.lineWidth = bw2;
+      ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, aR0 - (aR0 - aR1) * hpF, aR0); ctx.stroke();
+    }
+  } else {
+    const MAXM = 4, blocksLeft = Math.max(0, Math.ceil(integrity / 25));
+    const span = (aR0 - aR1) / MAXM, gap2 = span * 0.07; // thin seams keep them reading as one bar
+    for (let i = 0; i < MAXM; i++) {
+      const s0 = aR0 - (i + 1) * span + gap2 / 2, s1 = aR0 - i * span - gap2 / 2;
+      ctx.strokeStyle = i < blocksLeft ? '#8fc7ff' : 'rgba(15,28,48,0.8)';
+      ctx.lineWidth = bw2;
       ctx.beginPath(); ctx.arc(g.cx, g.cy, barR, s0, s1); ctx.stroke();
     }
   }
@@ -2120,6 +2300,7 @@ function infoCrystal(r, pal) {
   ctx.beginPath(); ctx.arc(0, 0, r * 0.45, 0, TAU); ctx.fill();
 }
 const INFO_PAL = {
+  boss:   { glow: '200,70,255',  shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'], core: '#b03ae8' },
   normal: { glow: '255,60,90',   shades: ['#e8274b', '#ff5a3c', '#d81f6e', '#b3123a', '#ff8c5a'], core: '#ff5a3c' },
   heavy:  { glow: '200,70,255',  shades: ['#b03ae8', '#8a2ad4', '#d465ff', '#6f14b8', '#c44af0'], core: '#b03ae8' },
   lock:   { glow: '80,170,255',  shades: ['#2f7fe0', '#1c4fae', '#4d9bff', '#12398a', '#3f8af0'], core: '#2f7fe0' },
@@ -2174,7 +2355,7 @@ function drawInfoGlyph(kind, cx, cy, r) {
     }
   } else {
     infoCrystal(r, INFO_PAL[kind] || INFO_PAL.normal);
-    if (kind === 'heavy') { // both node colors demanded
+    if (kind === 'heavy' || kind === 'boss') { // both node colors demanded
       ctx.strokeStyle = 'rgba(230,245,255,0.55)'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(0, 0, r * 1.3, 0, TAU); ctx.stroke();
       const oa = time * 1.4;
@@ -2799,7 +2980,7 @@ function perfWatch(rawDt) {
 let last = performance.now();
 function frame(now) {
   const rawDt = (now - last) / 1000;
-  const dt = Math.min(rawDt, 0.05);
+  const dt = clamp(rawDt, 0, 0.05); // clock can step backwards (timer quirks) — never simulate in reverse
   last = now;
   perfWatch(rawDt);
   update(dt);
@@ -2890,6 +3071,7 @@ function frame(now) {
   if (boss && state !== S.MENU) drawBoss(g);
 
   if (state !== S.MENU) drawNodes(g);
+  if (state !== S.MENU && boss) drawBeam(g);
 
   // particles + popups (over everything)
   for (const p of particles) {
